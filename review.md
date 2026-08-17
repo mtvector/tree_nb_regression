@@ -1,5 +1,11 @@
 # Statistical Review: `tree_nb_regression`
 
+> **Historical working document.** This file preserves the original review and
+> subsequent simulation iteration log, so some early findings and remediation
+> rows describe superseded implementations. The current user-facing behavior,
+> defaults, and limitations are summarized in `README.md`. Re-run the simulation
+> notebook before treating any recorded calibration number as current evidence.
+
 Scope: review of `model.py`, `inference.py`, `pseudobulk.py`, `taxonomy_tree.py`,
 `species_tree.py`, and `README.md` in
 `/code/HMBA_Genomics/SpinalCord/xspecies/analysis/tree_nb_regression/`.
@@ -469,4 +475,3 @@ The fundamental fix (LRT-based tree-level inference that handles the
 non-identifiability properly, or a re-parameterization that breaks the
 nested aliasing) is a larger architectural change beyond the scope of
 this iteration cycle.
-

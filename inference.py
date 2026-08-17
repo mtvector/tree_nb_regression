@@ -38,14 +38,13 @@ in low-variability clades.
 from __future__ import annotations
 
 import warnings
-from typing import Iterable
+from typing import Any, Iterable, cast
 
 import numpy as np
 import pandas as pd
 from scipy.special import ndtr  # standard-normal CDF
 
-from .results import TreeNBResult
-
+from .results import Array, TreeNBResult
 
 __all__ = ["compute_wald_significance", "add_bh_qvalues"]
 
@@ -73,7 +72,7 @@ def _expand_dispersion_coefs(
     res: TreeNBResult,
     family: str,
     n_groups: int,
-) -> np.ndarray | None:
+) -> Array | None:
     """Return the contribution X_disp_f @ disp_beta_f to log_overdisp,
     expanded to shape (n_groups, n_genes) for the active columns of family.
     Returns None if there is no dispersion fit for ``family``.
@@ -89,18 +88,23 @@ def _expand_dispersion_coefs(
     return X @ B
 
 
-def _compute_mu(res: TreeNBResult) -> np.ndarray:
+def _compute_mu(res: TreeNBResult) -> Array:
     """Compute the fitted per-(group, gene) NB mean mu = exp(eta).
 
     eta_ig = log(L_i) + alpha_g + sum_f (X_f @ beta_f)[i, g] + gamma_ig
     """
     L = res.library_sizes
+    intercept = res.intercept
+    designs = res.designs
+    assert L is not None
+    assert intercept is not None
+    assert designs is not None
     n_groups = L.shape[0]
     n_genes = res.n_genes
     eta = np.log(L + 1e-8)[:, None] + np.broadcast_to(
-        res.intercept[None, :], (n_groups, n_genes)
+        intercept[None, :], (n_groups, n_genes)
     ).copy()
-    for family, X in res.designs.items():
+    for family, X in designs.items():
         B = res.coefficients[family]                # (n_cols, n_genes)
         if X.shape[1] != B.shape[0]:
             raise RuntimeError(
@@ -111,10 +115,10 @@ def _compute_mu(res: TreeNBResult) -> np.ndarray:
     if res.gamma is not None:
         eta += res.gamma
     np.clip(eta, a_min=None, a_max=20.0, out=eta)
-    return np.exp(eta)
+    return cast(Array, np.exp(eta))
 
 
-def _compute_theta(res: TreeNBResult) -> np.ndarray:
+def _compute_theta(res: TreeNBResult) -> Array:
     """Compute the fitted per-(group, gene) NB dispersion theta.
 
     log_overdisp_ig = phi0_g + disp_offset_i + sum_f (X_disp_f @ disp_beta_f)[i, g]
@@ -122,9 +126,13 @@ def _compute_theta(res: TreeNBResult) -> np.ndarray:
 
     phi0_g = -log_theta_baseline[g] (per the model parameterization).
     """
-    n_groups = res.library_sizes.shape[0]
+    library_sizes = res.library_sizes
+    log_theta_baseline = res.log_theta_baseline
+    assert library_sizes is not None
+    assert log_theta_baseline is not None
+    n_groups = library_sizes.shape[0]
     n_genes = res.n_genes
-    phi0 = -np.asarray(res.log_theta_baseline)      # (n_genes,)
+    phi0 = -np.asarray(log_theta_baseline)      # (n_genes,)
     log_od = np.broadcast_to(phi0[None, :], (n_groups, n_genes)).copy()
     if res.disp_offset is not None:
         log_od += np.asarray(res.disp_offset)[:, None]
@@ -134,7 +142,7 @@ def _compute_theta(res: TreeNBResult) -> np.ndarray:
             if contrib is not None:
                 log_od += contrib
     np.clip(log_od, a_min=-10.0, a_max=10.0, out=log_od)
-    return np.exp(-log_od)
+    return cast(Array, np.exp(-log_od))
 
 
 def _family_node_label(
@@ -262,11 +270,13 @@ def compute_wald_significance(
     """
     _ensure_artifacts(res)
 
-    all_mean_families = list(res.designs.keys())
+    designs = res.designs
+    assert designs is not None
+    all_mean_families = list(designs.keys())
     if families is not None:
         report_families = set(families)
         for f in report_families:
-            if f not in res.designs:
+            if f not in designs:
                 raise KeyError(f"Family '{f}' not in fitted designs.")
     else:
         report_families = set(all_mean_families)
@@ -281,21 +291,22 @@ def compute_wald_significance(
     dropped_cols: dict[str, set[int]] = {f: set() for f in all_mean_families}
     if drop_root_columns:
         for f in ("tax_global", "species_global"):
-            if f not in res.designs:
+            if f not in designs:
                 continue
-            Xf = res.designs[f]
+            Xf = designs[f]
             for j in range(Xf.shape[1]):
                 if np.ptp(Xf[:, j]) < 1e-12:
                     dropped_cols[f].add(j)
 
-    from .model import SUMZERO_ANCHOR_MU  # local import to avoid cycle
     from scipy.linalg import cho_factor, cho_solve
 
-    rows: list[dict] = []
+    from .model import SUMZERO_ANCHOR_MU  # local import to avoid cycle
+
+    rows: list[dict[str, Any]] = []
     n_chol_fail = 0
 
     for family in all_mean_families:
-        X = res.designs[family]                          # (n_groups, n_cols)
+        X = designs[family]                          # (n_groups, n_cols)
         B = res.coefficients[family]                     # (n_cols, n_genes)
         n_cols = X.shape[1]
         if n_cols == 0:
@@ -458,7 +469,7 @@ def add_bh_qvalues(
     return out
 
 
-def _bh(p: np.ndarray) -> np.ndarray:
+def _bh(p: Array) -> Array:
     """Benjamini-Hochberg step-up."""
     p = np.asarray(p, dtype=float)
     n = p.size

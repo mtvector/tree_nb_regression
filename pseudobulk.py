@@ -5,7 +5,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 from scipy import sparse
+
+type Array = NDArray[np.generic]
 
 
 @dataclass
@@ -13,7 +16,7 @@ class PseudobulkData:
     group_meta: pd.DataFrame
     cell_to_group: sparse.csc_matrix
     n_groups: int
-    library_sizes: np.ndarray | None
+    library_sizes: Array | None
 
 
 def build_pseudobulk(
@@ -78,12 +81,12 @@ def build_pseudobulk(
 
 
 def aggregate_chunk(
-    X_chunk: sparse.spmatrix | np.ndarray,
+    X_chunk: sparse.spmatrix | Array,
     cell_to_group: sparse.spmatrix,
-) -> np.ndarray:
+) -> Array:
     """Aggregate a gene chunk: Y = P.T @ X_chunk."""
     if sparse.issparse(X_chunk):
-        X_chunk = X_chunk.tocsc()
+        X_chunk = sparse.csc_matrix(X_chunk)
     P_t = cell_to_group.T.tocsr()
     Y = P_t @ X_chunk
     if sparse.issparse(Y):

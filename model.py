@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -14,7 +14,6 @@ from .pseudobulk import PseudobulkData, aggregate_chunk, build_pseudobulk
 from .results import TreeNBResult
 from .species_tree import SpeciesTreeDesign, build_species_tree_design
 from .taxonomy_tree import TaxonomyTree, build_taxonomy_tree_from_obs
-
 
 DEFAULT_GLOBAL_LAMBDA = 0.09
 
@@ -228,7 +227,6 @@ def _build_design_matrices(
 
     # Batch design (one-hot, unpenalized)
     batch_design = None
-    batch_names = None
     if batch_col is not None and batch_col in gm.columns:
         batches = sorted(gm[batch_col].unique())
         if len(batches) > 1:
@@ -239,11 +237,9 @@ def _build_design_matrices(
                 b = str(row[batch_col])
                 if b in batch_to_idx:
                     batch_design[grp_idx, batch_to_idx[b]] = 1.0
-            batch_names = batches[1:]
 
     # Donor design
     donor_design = None
-    donor_names = None
     if donor_col is not None and donor_col in gm.columns:
         donors = sorted(gm[donor_col].unique())
         if len(donors) > 1:
@@ -253,7 +249,6 @@ def _build_design_matrices(
                 d = str(row[donor_col])
                 if d in donor_to_idx:
                     donor_design[grp_idx, donor_to_idx[d]] = 1.0
-            donor_names = donors[1:]
 
     designs = {
         "tax_global": A_tax_full,
@@ -537,7 +532,7 @@ def _sumzero_anchor_penalty(
     if total is None:
         any_beta = next(iter(betas.values()))
         return torch.zeros((), dtype=any_beta.dtype, device=any_beta.device)
-    return total
+    return cast(torch.Tensor, total)
 
 
 def _group_lasso_penalty(
@@ -802,6 +797,7 @@ def _fit_gene_chunk(
 
         # Penalty on residual intercepts: simple L1 scaled by sqrt(2*log(n_groups))
         if gamma is not None:
+            assert residual_lambda is not None
             residual_scale = residual_lambda * math.sqrt(2 * math.log(n_groups))
             loss = loss + residual_scale * _smooth_l1(gamma).sum()
 
@@ -824,7 +820,6 @@ def _fit_gene_chunk(
     result_nonzero = {}
     threshold = 0.01
 
-    stx_families = set(species_tax_node_groups.keys()) if species_tax_node_groups else set()
     for family, beta in betas.items():
         b = beta.detach().cpu().numpy()
         result_betas[family] = b
@@ -1233,7 +1228,7 @@ def _refit_dispersion_support(
 
 
 def fit_tree_nb(
-    adata,
+    adata: Any,
     taxonomy_cols: list[str],
     species_col: str,
     species_tree: str | tuple,
@@ -1243,7 +1238,7 @@ def fit_tree_nb(
     gene_chunk_size: int = 512,
     min_cells_per_pseudobulk: int = 10,
     global_lambda: float | None = None,
-    l1_lambdas: dict | None = None,
+    l1_lambdas: dict[str, float] | None = None,
     residual_lambda: float | None = None,
     max_iter: int = 500,
     device: str = "cpu",
@@ -1356,6 +1351,7 @@ def fit_tree_nb(
             "Consider disabling one."
         )
     # Determine penalty: global_lambda takes precedence
+    penalty: float | dict[str, float]
     if global_lambda is not None:
         penalty = global_lambda
     elif l1_lambdas is not None:
@@ -1574,6 +1570,7 @@ def fit_tree_nb(
     # Dispersion coefficient metadata — map back to original tree node ids
     disp_coef_metadata: pd.DataFrame | None = None
     if final_disp_coef is not None:
+        assert final_disp_nonzero is not None
         disp_rows = []
         for family, coefs in final_disp_coef.items():
             active = disp_active_indices[family]
@@ -1610,6 +1607,7 @@ def fit_tree_nb(
         diagnostics["gamma_total"] = n_total_gamma
         diagnostics["gamma_sparsity_pct"] = 100 * (1 - n_nonzero_gamma / n_total_gamma)
     if final_disp_coef is not None:
+        assert final_disp_nonzero is not None
         diagnostics["dispersion_nonzero_per_family"] = {
             f: int(m.sum()) for f, m in final_disp_nonzero.items()
         }

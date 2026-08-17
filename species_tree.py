@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 
-
-NestedTuple = Union[str, tuple]
+type NestedTuple = str | tuple[tuple[NestedTuple, ...], str]
 
 
 @dataclass
@@ -20,14 +19,14 @@ class SpeciesTreeDesign:
     node_table: pd.DataFrame
 
 
-def _parse_newick(newick: str) -> tuple:
+def _parse_newick(newick: str) -> NestedTuple:
     """Parse a simple Newick string (no branch lengths) into nested tuples."""
     newick = newick.strip().rstrip(";").strip()
 
-    def _parse_subtree(s: str, pos: int) -> tuple[Any, int]:
+    def _parse_subtree(s: str, pos: int) -> tuple[NestedTuple, int]:
         if s[pos] == "(":
             pos += 1
-            children = []
+            children: list[NestedTuple] = []
             while True:
                 child, pos = _parse_subtree(s, pos)
                 children.append(child)
@@ -61,9 +60,9 @@ def _parse_newick(newick: str) -> tuple:
 
 
 def _collect_nodes(
-    tree: tuple | str,
+    tree: NestedTuple,
     parent_id: str | None,
-    nodes: list[dict],
+    nodes: list[dict[str, Any]],
     counter: list[int],
 ) -> None:
     """Recursively collect nodes from nested tuple tree."""
@@ -98,7 +97,7 @@ def _collect_nodes(
 def _get_ancestors(node_id: str, parent_map: dict[str, str | None]) -> list[str]:
     """Get path from root to node (inclusive), in root-first order."""
     path = []
-    current = node_id
+    current: str | None = node_id
     while current is not None:
         path.append(current)
         current = parent_map.get(current)
@@ -106,7 +105,7 @@ def _get_ancestors(node_id: str, parent_map: dict[str, str | None]) -> list[str]
 
 
 def build_species_tree_design(
-    species_tree: str | tuple,
+    species_tree: NestedTuple,
     observed_species: list[str],
 ) -> SpeciesTreeDesign:
     """Build species path-indicator design matrix from a tree.
@@ -121,7 +120,7 @@ def build_species_tree_design(
     else:
         parsed = species_tree
 
-    nodes: list[dict] = []
+    nodes: list[dict[str, Any]] = []
     counter = [0]
     _collect_nodes(parsed, None, nodes, counter)
     node_table = pd.DataFrame(nodes)

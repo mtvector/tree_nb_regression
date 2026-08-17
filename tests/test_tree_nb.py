@@ -1,17 +1,17 @@
 """Tests for tree-structured NB regression."""
 from __future__ import annotations
 
+import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
 from scipy import sparse
 
-import anndata as ad
-
-from tree_nb_regression.taxonomy_tree import build_taxonomy_tree_from_obs
-from tree_nb_regression.species_tree import build_species_tree_design
-from tree_nb_regression.pseudobulk import build_pseudobulk, aggregate_chunk
+from tree_nb_regression.inference import add_bh_qvalues, compute_wald_significance
 from tree_nb_regression.model import fit_tree_nb
+from tree_nb_regression.pseudobulk import aggregate_chunk, build_pseudobulk
+from tree_nb_regression.species_tree import build_species_tree_design
+from tree_nb_regression.taxonomy_tree import build_taxonomy_tree_from_obs
 
 
 def _make_synthetic_adata(
@@ -21,19 +21,6 @@ def _make_synthetic_adata(
 ) -> ad.AnnData:
     """Create synthetic AnnData with taxonomy, species, batch columns."""
     rng = np.random.default_rng(seed)
-
-    taxonomy = {
-        "Neighborhood": ["N", "NN"],
-        "Class": ["Glut", "GABA", "MN"],
-        "Subclass": ["Glut-V", "Glut-D", "GABA-V", "GABA-D", "MN-a", "MN-g"],
-        "Group": [
-            "Glut-V-1", "Glut-V-2", "Glut-D-1", "GABA-V-1", "GABA-V-2",
-            "GABA-D-1", "MN-a-1", "MN-g-1",
-        ],
-        "final_cluster": [
-            "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10",
-        ],
-    }
 
     # Define taxonomy paths (each final_cluster has a unique path)
     paths = [
@@ -197,6 +184,7 @@ def test_no_dense_tensor():
 
 def test_weighted_l1_scales():
     import torch
+
     from tree_nb_regression.model import _compute_penalty_scales
 
     rng = np.random.default_rng(99)
@@ -273,10 +261,8 @@ def test_broad_taxonomy_effect():
     # at the Class-level node for Glut
     tax_coefs = res.coefficients["tax_global"][:, 0]  # gene 0
     tax_nodes = res.taxonomy_node_table
-    class_nodes = tax_nodes[tax_nodes["level"] == "Class"]
 
     # Find indices of Class-level nodes in the design
-    class_node_ids = set(class_nodes["node_id"].values)
     all_node_ids = list(tax_nodes["node_id"].values) if hasattr(res, '_node_ids') else list(res.taxonomy_node_table["node_id"].values)
 
     # The max abs coefficient should be at a high level (not leaf)
@@ -552,7 +538,6 @@ def test_dispersion_null_signal_stays_sparse():
     # difference is essentially zero, so the L1+refit dispersion coefs should
     # have small abs values.
     df = res.get_dispersion_df("tax_global")
-    median_abs = df.abs().values[df.abs().values > 0].mean() if (df.abs() > 0).any().any() else 0.0
     # The L1 stage drives most below 0.01; survivors are bounded by data
     # information. We're satisfied if mean(|nonzero coef|) is modest (<0.5)
     # and the max is below a threshold a user would set for "real" calls.
@@ -679,9 +664,6 @@ def test_dispersion_call_threshold_semantics():
 
 
 # ─── Wald inference tests ────────────────────────────────────────────────────
-
-from tree_nb_regression.inference import compute_wald_significance, add_bh_qvalues
-
 
 def test_wald_artifacts_present():
     adata = _make_disp_adata(n_donors_per_species=4, n_cells_per_donor_cluster=40, n_genes=4)

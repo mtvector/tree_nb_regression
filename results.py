@@ -6,35 +6,38 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+
+type Array = NDArray[Any]
 
 
 @dataclass
 class TreeNBResult:
-    coefficients: dict[str, np.ndarray]
+    coefficients: dict[str, Array]
     coef_metadata: pd.DataFrame
-    selected_nonzero: dict[str, np.ndarray]
+    selected_nonzero: dict[str, Array]
     group_meta: pd.DataFrame
     taxonomy_node_table: pd.DataFrame
     species_node_table: pd.DataFrame
     gene_names: list[str]
     diagnostics: dict[str, Any] = field(default_factory=dict)
-    gamma: np.ndarray | None = None  # per-group residual intercepts (n_groups, n_genes)
-    intercept: np.ndarray | None = None  # per-gene intercept alpha (n_genes,)
+    gamma: Array | None = None  # per-group residual intercepts (n_groups, n_genes)
+    intercept: Array | None = None  # per-gene intercept alpha (n_genes,)
     # Dispersion-tree fields (populated only when fit_dispersion_tree=True).
     # Each coefficient is in log_overdispersion space (= -log theta), so a
     # POSITIVE value means the node's subtree is MORE VARIABLE across replicates
     # than the gene baseline; NEGATIVE means more consistent.
-    dispersion_coefficients: dict[str, np.ndarray] | None = None
-    dispersion_selected_nonzero: dict[str, np.ndarray] | None = None
+    dispersion_coefficients: dict[str, Array] | None = None
+    dispersion_selected_nonzero: dict[str, Array] | None = None
     dispersion_coef_metadata: pd.DataFrame | None = None
-    dispersion_active_indices: dict[str, np.ndarray] | None = None
+    dispersion_active_indices: dict[str, Array] | None = None
     # Artifacts needed for downstream Wald-style inference. None when not fit
     # or when the user opts out (keep_design_artifacts=False).
-    library_sizes: np.ndarray | None = None
-    log_theta_baseline: np.ndarray | None = None  # per-gene baseline log(theta)
-    disp_offset: np.ndarray | None = None  # per-group additive offset on log_overdisp
-    designs: dict[str, np.ndarray] | None = None  # full design matrices (unmasked)
-    dispersion_designs: dict[str, np.ndarray] | None = None  # post-mask disp designs
+    library_sizes: Array | None = None
+    log_theta_baseline: Array | None = None  # per-gene baseline log(theta)
+    disp_offset: Array | None = None  # per-group additive offset on log_overdisp
+    designs: dict[str, Array] | None = None  # full design matrices (unmasked)
+    dispersion_designs: dict[str, Array] | None = None  # post-mask disp designs
     # species_tax_<level> per-column metadata (level, node_id, node_label,
     # species, n_species_at_node) — required by inference to label rows for
     # the sum-to-zero parameterization, where column index does NOT have the
@@ -79,6 +82,8 @@ class TreeNBResult:
                 f"Dispersion family '{family}' not found. Available: "
                 f"{list(self.dispersion_coefficients.keys())}"
             )
+        if self.dispersion_coef_metadata is None:
+            raise RuntimeError("Dispersion coefficient metadata is missing.")
         coefs = self.dispersion_coefficients[family]
         meta = self.dispersion_coef_metadata[
             self.dispersion_coef_metadata["family"] == family
@@ -147,4 +152,3 @@ class TreeNBResult:
                     "max_nonzero_per_gene": int(np.max(n_nonzero)),
                 })
         return pd.DataFrame(rows)
-

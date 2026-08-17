@@ -1,11 +1,11 @@
 """Tree-structured pseudobulk negative-binomial regression."""
 
-from .taxonomy_tree import build_taxonomy_tree_from_obs
-from .species_tree import build_species_tree_design
+from .inference import add_bh_qvalues, compute_wald_significance
+from .model import DEFAULT_GLOBAL_LAMBDA, fit_tree_nb
 from .pseudobulk import build_pseudobulk
-from .model import fit_tree_nb, DEFAULT_GLOBAL_LAMBDA
 from .results import TreeNBResult
-from .inference import compute_wald_significance, add_bh_qvalues
+from .species_tree import build_species_tree_design
+from .taxonomy_tree import build_taxonomy_tree_from_obs
 
 __all__ = [
     "build_taxonomy_tree_from_obs",

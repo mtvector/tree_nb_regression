@@ -1,154 +1,181 @@
 # Tree-Structured Pseudobulk NB Regression
 
-Memory-efficient negative-binomial regression using taxonomy hierarchy and species tree as additive path-indicator design bases.
+Memory-efficient negative-binomial regression using taxonomy and species trees
+as additive path-indicator design bases.
+
+> [!WARNING]
+> This is research software for exploratory coefficient screening. The current
+> Wald statistics are post-selection, use conditional per-family Hessians, and
+> do not account fully for donor-level correlation or dependencies between
+> nested tree levels. Their `p` and `q` values are not confirmatory error-rate
+> guarantees. See [Statistical status](#statistical-status) and `review.md`.
+
+## Installation
+
+The supported reproducible environment is defined in `environment.yml`.
+
+```bash
+export TMPDIR=/scratch/tmp MPLCONFIGDIR=/scratch/mpl
+mkdir -p "$TMPDIR" "$MPLCONFIGDIR"
+mamba env create -f environment.yml
+mamba activate tree-nb-regression
+python -m pip install --no-deps -e .
+```
+
+For development checks, install the pinned optional dependencies:
+
+```bash
+python -m pip install --cache-dir /scratch/pipcache -e '.[dev]'
+```
 
 ## Model
 
-For pseudobulk group `i`, gene `g`:
+For pseudobulk group `i` and gene `g`:
 
-```
+```text
 Y[i,g] ~ NB(mu[i,g], theta[i,g])
 
 log(mu[i,g]) =
     offset[i]
   + alpha[g]
-  + A_tax[k_i, :] @ beta_tax[:, g]                  # taxonomy path indicator
-  + A_species[s_i, :] @ beta_species[:, g]          # species-tree path indicator
-  + A_species_tax_level[...] @ gamma[:, g]          # species x tax interaction
+  + A_tax[k_i, :] @ beta_tax[:, g]
+  + A_species[s_i, :] @ beta_species[:, g]
+  + A_species_tax_level[...] @ gamma[:, g]
   + X_batch[i, :] @ delta_batch[:, g]
   + optional donor effect
 ```
 
-Penalties are weighted L1 (Laplace) calibrated by Fisher information so that
-coefficients have comparable cost per unit effect on the linear predictor.
+The selection pass applies a smooth, Fisher-scaled L1 penalty to every design
+family, including batch and donor when supplied. The Fisher scale is currently
+averaged over the genes in each processing chunk. Non-interaction families are
+then refitted without an L1 penalty on the selected support using Adam;
+`species_tax_*` estimates remain frozen at their penalized values.
 
-### Sum-to-zero coding of `species_tax_<level>` blocks
+The default global penalty is `DEFAULT_GLOBAL_LAMBDA = 0.09`.
 
-For each taxonomy node `n` at level L with species set `S(n)` (those species
-that have any cells in the subtree under `n`), the interaction block
-`species_tax_<L>` uses **K = |S(n)| centered indicator columns**, one per
-species in `S(n)`:
+### Species-by-taxonomy coding
 
+For taxonomy node `n`, let `S(n)` be the species represented below that node
+and `K = |S(n)|`. Nodes with fewer than two species are skipped. For each
+remaining species `s`, the design contains a centered column:
+
+```text
+X[(s,n)][i] = +(K-1)/K  if group i is species s below node n
+              -1/K      if group i is another species below node n
+               0        otherwise
 ```
-X[(s, n)][i] = +(K-1)/K  if  anc(i)=n  and  species(i)=s
-             = -1/K      if  anc(i)=n  and  species(i)!=s
-             =  0        if  anc(i)!=n
-```
 
-Each row's K values sum to 0 (column space is orthogonal to the constant and
-to `tax_global[n]`), and a quadratic anchor
-`0.5 * SUMZERO_ANCHOR_MU * (sum_s beta[s, n, g])^2` is added to both the L1
-optimization and the post-selection refit so that fitted coefficients
-satisfy `sum_{s in S(n)} beta[s, n, g] = 0` to floating-point precision.
-
-This makes the parameterization:
-
-- **Symmetric across species under the L1 penalty** (no arbitrary
-  "reference" species — permuting species labels yields the same
-  |beta| per (species, node, gene)).
-- **Restricted to identifiable contrasts** at each node: species not
-  present in the subtree get no column, and nodes with |S(n)| < 2 are
-  skipped entirely.
-- **Interpretable as deviations**: beta[s, n, g] is species s's deviation
-  from the cross-species mean at node n for gene g; the mean-across-species
-  effect at node n lives entirely in `tax_global[n]`.
-
-The Wald-inference Hessian is augmented with the same quadratic anchor so
-post-selection standard errors are well-defined despite the rank-(K-1)
-within-block design. See `SUMZERO_ANCHOR_MU` in `model.py`.
+The columns sum to zero across species for each row. Their coefficients have a
+soft quadratic anchor on `sum_s beta[s,n,g]`; therefore coefficient sums are
+approximately, not algebraically, zero. The interaction coefficients are
+species-symmetric screening effects, while mean effects at the node are carried
+by `tax_global`.
 
 ## Usage
 
 ```python
 import anndata as ad
+
 from tree_nb_regression import fit_tree_nb
 
-adata = ad.read_h5ad("path/to/data.h5ad")
-# Use raw counts (e.g. from UMIs layer)
-adata.X = adata.layers["UMIs"].copy()
+adata = ad.read_h5ad("/data/counts.h5ad")
 
+res = fit_tree_nb(
+    adata,
+    taxonomy_cols=[
+        "Neighborhood",
+        "Class_V2",
+        "Subclass_V2",
+        "Group_V2",
+        "final_cluster",
+    ],
+    species_col="species",
+    species_tree="(Mouse,((Macaque_mulatta,Macaque_nemestrina),Human));",
+    counts_layer="UMIs",
+    batch_col="batch",
+    donor_col="donor_name",
+)
+
+print(res.summary())
+tax_coefficients = res.get_coefficients_df("tax_global")
+```
+
+Raw nonnegative integer counts are required. Prefer `counts_layer` to replacing
+`adata.X`, which avoids copying a potentially large matrix.
+
+## Tree-structured dispersion
+
+Pass `fit_dispersion_tree=True` to fit lasso-selected dispersion deviations
+after the mean fit. Coefficients parameterize log-overdispersion (`-log theta`),
+so positive values denote greater variability than the gene baseline.
+
+```python
 res = fit_tree_nb(
     adata,
     taxonomy_cols=["Neighborhood", "Class_V2", "Subclass_V2", "Group_V2", "final_cluster"],
     species_col="species",
     species_tree="(Mouse,((Macaque_mulatta,Macaque_nemestrina),Human));",
-    batch_col="batch",
-    donor_col="donor_name",
-)
-
-# Examine results
-print(res.summary())
-print(res.diagnostics)
-
-# Get coefficients for a specific family
-tax_df = res.get_coefficients_df("tax_global")
-```
-
-## Tree-structured dispersion (optional)
-
-Pass `fit_dispersion_tree=True` to also fit lasso‑selected, tree‑structured
-**dispersion** deviations after the mean is fit. Each pseudobulk group's
-log‑overdispersion (`-log θ`) becomes
-`phi0[g] + tree deviations + (optional) -log(n_cells)` so that a *positive*
-coefficient at a tree node means **"this clade is more variable across
-donors than the gene baseline"** — and conversely for negative.
-
-```python
-res = fit_tree_nb(
-    adata,
-    taxonomy_cols=[...],
-    species_col="species",
-    species_tree="(Mouse,((Macaque_mulatta,Macaque_nemestrina),Human));",
+    counts_layer="UMIs",
     donor_col="donor_name",
     fit_dispersion_tree=True,
-    dispersion_lambda=0.3,          # independent of global_lambda
-    min_replicates_per_node=3,      # mask under-replicated nodes
+    dispersion_lambda=0.3,
+    min_replicates_per_node=3,
 )
 
-# Inspect dispersion calls
-disp_df = res.get_dispersion_df("tax_global")          # rows = tree node ids
-calls   = res.call_dispersion("tax_global", threshold=0.2)
-calls[calls["above"]]   # nodes called "above baseline" for ≥1 gene
+dispersion = res.get_dispersion_df("tax_global")
+calls = res.call_dispersion("tax_global", threshold=0.2)
 ```
 
-Design notes:
-- **Two‑stage** by default: mean coefficients (post‑selection refit) are
-  frozen before dispersion fitting, so L1‑shrunk mean structure can't leak
-  into dispersion as fake heterogeneity.
-- **Replicate masking**: dispersion design columns whose subtree spans
-  fewer than `min_replicates_per_node` distinct donors are dropped *before*
-  L1, since they cannot identify dispersion.
-- **Duplicate columns dropped**: when neighboring tree levels yield
-  identical indicator vectors (common in shallow slices), only one
-  representative is kept to avoid the L1 spreading a single effect across
-  redundant columns.
-- **Cell‑count offset**: `-log(n_cells)` is added to log‑overdispersion by
-  default (`dispersion_cell_offset=True`) so pseudobulk size differences
-  don't masquerade as dispersion shifts.
-- **Limitation**: only the marginal `tax_global` and `species_global` are
-  enabled by default; `species_tax_<level>` interactions on dispersion are
-  intentionally omitted (under‑replicated in typical datasets).
+By default, only `tax_global` and `species_global` participate in the
+dispersion fit. Exact duplicate columns and columns with too few replicate
+groups are removed. The optional `-log(n_cells)` offset assumes independent,
+similarly sequenced cells; correlated cells or heterogeneous per-cell depth can
+violate that approximation.
 
+## Statistical status
 
-## Architecture
+The coefficient-fitting pipeline is useful for exploratory ranking and has
+synthetic recovery tests. Important limitations remain:
 
-- `taxonomy_tree.py` — Builds taxonomy tree from obs columns, returns path-indicator matrix
-- `species_tree.py` — Parses Newick/tuple species tree, returns path-indicator matrix
-- `pseudobulk.py` — Sparse pseudobulk aggregation (no dense tensor allocation)
-- `model.py` — Core NB fitting with chunked gene processing and weighted L1
-- `results.py` — Result container with accessors
+- pseudobulks from the same donor are treated as independent by Wald inference;
+- donor and batch terms participate in L1 support selection;
+- root and nested path-indicator columns are not fully identifiable jointly;
+- Wald tests condition on other fitted families and ignore selection;
+- BH adjustment is performed on the reported selected support, not the full
+  pre-selection hypothesis universe;
+- fitted dispersion is treated as known when computing mean-effect uncertainty;
+- penalty calibration is gene-chunk dependent.
 
-## Key Design Decisions
+The empirical simulation summarized in `review.md` found inflated Type-I error
+for several inner taxonomy levels and nuisance families. Use `p` and `q` only
+as screening diagnostics until donor-aware, identifiable inference is added.
 
-1. **No phylogenetic covariance** — Trees are used only as path-indicator design bases
-2. **Sparse aggregation** — Only observed combinations are materialized
-3. **Fisher-calibrated penalties** — Each column penalized proportional to its Fisher norm
-4. **Post-selection refit** — After L1 selects support, refit with weak ridge to reduce bias
-5. **Gene chunking** — Processes genes in configurable chunks to limit memory
+## Repository layout
 
-## Tests
+- `taxonomy_tree.py`: taxonomy construction and path-indicator design
+- `species_tree.py`: limited Newick/tuple parser and species design
+- `pseudobulk.py`: sparse observed-group aggregation
+- `model.py`: chunked NB fitting, selection, refit, and dispersion model
+- `inference.py`: exploratory Wald statistics and BH adjustment
+- `results.py`: result container and tabular accessors
+- `tests/`: synthetic unit and integration tests
+- `notebooks/`: simulation and spinal-cord analyses
+- `review.md`: detailed statistical review and simulation history
+
+## Development
+
+Run checks from the repository root:
 
 ```bash
-cd /code/HMBA_Genomics/SpinalCord/xspecies/analysis
-python -m pytest tree_nb_regression/tests/test_tree_nb.py -v
+export TMPDIR=/scratch/tmp MPLCONFIGDIR=/scratch/mpl
+mkdir -p "$TMPDIR" "$MPLCONFIGDIR"
+python -m pytest
+python -m ruff check .
+python -m mypy --strict
+python -m nbstripout --verify notebooks/*.ipynb
 ```
+
+Notebook outputs are intentionally excluded from version control. Store final
+capsule artifacts in `/results`; use `/scratch` only for ephemeral intermediates.
+After cloning, run `nbstripout --install` once to activate the configured Git
+filter locally.
