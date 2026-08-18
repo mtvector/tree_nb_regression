@@ -12,10 +12,11 @@ from scipy import sparse
 
 from .pseudobulk import PseudobulkData, aggregate_chunk, build_pseudobulk
 from .results import TreeNBResult
+from .shrinkage import EmpiricalBayesConfig, ShrinkagePrior
 from .species_tree import SpeciesTreeDesign, build_species_tree_design
 from .taxonomy_tree import TaxonomyTree, build_taxonomy_tree_from_obs
 
-DEFAULT_GLOBAL_LAMBDA = 0.09
+DEFAULT_GLOBAL_LAMBDA = 0.05
 
 # Dispersion side is noisier than the mean side (information per coefficient
 # comes from replicate variance, not from cell-count). Default penalty is
@@ -224,6 +225,13 @@ def _build_design_matrices(
             species_tax_blocks[family_name] = np.column_stack(cols_list)
             species_tax_meta[family_name] = pd.DataFrame(meta_rows)
             species_tax_node_groups[family_name] = node_groups
+
+    if orthogonal_tree and species_tax_blocks:
+        species_tax_blocks = _orthogonalize_interaction_blocks(
+            blocks=species_tax_blocks,
+            taxonomy_cols=taxonomy_cols,
+            nuisance=np.column_stack([A_tax_full, A_species_full]),
+        )
 
     # Batch design (one-hot, unpenalized)
     batch_design = None
@@ -450,36 +458,68 @@ def _nb_nll(
 def _orthogonalize_path_indicators(
     A: np.ndarray, tax_tree: "TaxonomyTree"
 ) -> np.ndarray:
-    """Helmert / nested-deviation reparameterization of path indicators.
+    """Residualize every taxonomy level against all of its ancestor levels.
 
     Input:  A[i, n] = 1 if group i's path passes through node n.
-    Output: each non-root column residualized against its parent's
-            column over the group axis, so col_n ⟂ col_p (Frobenius).
-    The root column is left unchanged (it will be dropped by
-    ``drop_root_columns=True`` in inference, and is aliased with the
-    intercept α during fitting anyway).
+    Output: columns at level L are jointly residualized against the span of
+            every earlier level. Each residual is rescaled to the original
+            column L2 norm, retaining a common RMS log-effect interpretation
+            while making comparisons across levels insensitive to nesting.
     """
-    A_orth = A.copy()
+    A_orth = np.zeros_like(A, dtype=np.float64)
     node_table = tax_tree.node_table
     node_id_to_col = {nid: i for i, nid in enumerate(tax_tree.node_ids)}
-    # Process nodes in level order so parents are already orthogonalized
-    # before children read from them.
-    for _, row in node_table.sort_values("level_idx").iterrows():
-        parent_id = row.get("parent_id")
-        if parent_id is None or parent_id == "root":
-            continue
-        n_idx = node_id_to_col.get(row["node_id"])
-        p_idx = node_id_to_col.get(parent_id)
-        if n_idx is None or p_idx is None:
-            continue
-        col_n = A_orth[:, n_idx]
-        col_p = A_orth[:, p_idx]
-        denom = float((col_p ** 2).sum())
-        if denom < 1e-12:
-            continue
-        beta = float((col_n * col_p).sum()) / denom
-        A_orth[:, n_idx] = col_n - beta * col_p
+    prior = np.empty((A.shape[0], 0), dtype=np.float64)
+    for level_idx in sorted(node_table["level_idx"].unique()):
+        rows = node_table[node_table["level_idx"] == level_idx]
+        indices = [node_id_to_col[node_id] for node_id in rows["node_id"]]
+        raw = A[:, indices].astype(np.float64, copy=False)
+        residual = _residualize_and_rescale(raw=raw, basis=prior)
+        A_orth[:, indices] = residual
+        prior = np.column_stack([prior, residual])
     return A_orth
+
+
+def _orthonormal_basis(matrix: np.ndarray) -> np.ndarray:
+    """Return a tolerance-truncated orthonormal basis for a column space."""
+    if matrix.shape[1] == 0:
+        return np.empty((matrix.shape[0], 0), dtype=np.float64)
+    u, singular_values, _ = np.linalg.svd(matrix, full_matrices=False)
+    if singular_values.size == 0:
+        return np.empty((matrix.shape[0], 0), dtype=np.float64)
+    tolerance = np.finfo(np.float64).eps * max(matrix.shape) * singular_values[0]
+    return cast(np.ndarray, u[:, singular_values > tolerance])
+
+
+def _residualize_and_rescale(*, raw: np.ndarray, basis: np.ndarray) -> np.ndarray:
+    """Project columns off a basis and restore each original L2 norm."""
+    q = _orthonormal_basis(basis)
+    residual = raw - q @ (q.T @ raw) if q.shape[1] else raw.copy()
+    raw_norm = np.linalg.norm(raw, axis=0)
+    residual_norm = np.linalg.norm(residual, axis=0)
+    usable = residual_norm > 1e-10
+    residual[:, usable] *= raw_norm[usable] / residual_norm[usable]
+    residual[:, ~usable] = 0.0
+    return residual
+
+
+def _orthogonalize_interaction_blocks(
+    *,
+    blocks: dict[str, np.ndarray],
+    taxonomy_cols: list[str],
+    nuisance: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Make species-taxonomy levels orthogonal to nuisance and ancestors."""
+    result: dict[str, np.ndarray] = {}
+    prior = nuisance.astype(np.float64, copy=False)
+    for level in taxonomy_cols:
+        family = f"species_tax_{level}"
+        if family not in blocks:
+            continue
+        residual = _residualize_and_rescale(raw=blocks[family], basis=prior)
+        result[family] = residual
+        prior = np.column_stack([prior, residual])
+    return result
 
 
 def _smooth_l1(beta: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -492,6 +532,142 @@ def _smooth_l1(beta: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     planted effects with magnitude <0.5 in the sim eval).
     """
     return torch.sqrt(beta**2 + eps)
+
+
+def _empirical_bayes_penalty(
+    *,
+    beta: torch.Tensor,
+    prior: ShrinkagePrior,
+    scale: float,
+    responsibilities: torch.Tensor | None = None,
+    spike_scale: float = 0.02,
+) -> torch.Tensor:
+    """Return a fixed-scale Gaussian or Laplace negative log-prior."""
+    if prior is ShrinkagePrior.GAUSSIAN:
+        return 0.5 * (beta / scale).square().sum()
+    if prior is ShrinkagePrior.LAPLACE:
+        return (_smooth_l1(beta) / scale).sum()
+    if responsibilities is None:
+        raise ValueError("Spike-and-slab shrinkage requires responsibilities.")
+    precision = responsibilities / scale**2 + (1.0 - responsibilities) / spike_scale**2
+    return cast(torch.Tensor, 0.5 * (precision * beta.square()).sum())
+
+
+def _normal_expected_absolute(
+    *, mean: torch.Tensor, variance: torch.Tensor
+) -> torch.Tensor:
+    """Return E|X| for elementwise normal means and variances."""
+    sd = torch.sqrt(variance.clamp(min=1e-12))
+    standardized = mean.abs() / sd
+    return (
+        sd * math.sqrt(2.0 / math.pi) * torch.exp(-0.5 * standardized.square())
+        + mean.abs() * torch.erf(standardized / math.sqrt(2.0))
+    )
+
+
+def _update_empirical_bayes_scales(
+    *,
+    betas: dict[str, torch.Tensor],
+    designs: dict[str, torch.Tensor],
+    W: torch.Tensor,
+    scales: dict[str, float],
+    config: EmpiricalBayesConfig,
+) -> dict[str, float]:
+    """Perform one damped approximate-EM update of level prior scales."""
+    updated = dict(scales)
+    for family, old_scale in scales.items():
+        beta = betas[family].detach()
+        X = designs[family]
+        information = X.square().T @ W
+        usable = information > 1e-8
+        if not bool(usable.any()):
+            continue
+        if config.prior is ShrinkagePrior.GAUSSIAN:
+            posterior_variance = 1.0 / (information + old_scale**-2)
+            second_moment = beta.square() + posterior_variance
+            target = float(torch.sqrt(second_moment[usable].mean()).cpu())
+        else:
+            # A local Gaussian approximation supplies uncertainty for the
+            # Laplace M-step b = mean(E|beta|). The stability precision avoids
+            # infinite moments for nearly unsupported columns.
+            posterior_variance = 1.0 / (information + old_scale**-2)
+            expected_absolute = _normal_expected_absolute(
+                mean=beta, variance=posterior_variance
+            )
+            target = float(expected_absolute[usable].mean().cpu())
+        target = min(max(target, config.min_scale), config.max_scale)
+        updated[family] = (
+            (1.0 - config.damping) * old_scale + config.damping * target
+        )
+    return updated
+
+
+def _update_spike_slab_state(
+    *,
+    betas: dict[str, torch.Tensor],
+    designs: dict[str, torch.Tensor],
+    W: torch.Tensor,
+    scales: dict[str, float],
+    inclusion: dict[str, float],
+    responsibilities: dict[str, torch.Tensor],
+    config: EmpiricalBayesConfig,
+    update_global: bool,
+) -> tuple[dict[str, float], dict[str, float], dict[str, torch.Tensor]]:
+    """Update local mixture assignments and optional global spike-slab state."""
+    updated_scales = dict(scales)
+    updated_inclusion = dict(inclusion)
+    updated_responsibilities: dict[str, torch.Tensor] = {}
+    for family, slab_scale in scales.items():
+        beta = betas[family].detach()
+        information = designs[family].square().T @ W
+        usable = information > 1e-8
+        z = torch.zeros_like(beta)
+        z[usable] = beta[usable] * (
+            information[usable] + slab_scale**-2
+        ) / information[usable]
+        sampling_variance = torch.full_like(information, 1e8)
+        sampling_variance[usable] = 1.0 / information[usable]
+        pi = min(max(inclusion[family], 1e-4), 1.0 - 1e-4)
+        slab_variance = sampling_variance + slab_scale**2
+        spike_variance = sampling_variance + config.spike_scale**2
+        log_slab = (
+            math.log(pi)
+            - 0.5 * torch.log(slab_variance)
+            - 0.5 * z.square() / slab_variance
+        )
+        log_spike = (
+            math.log1p(-pi)
+            - 0.5 * torch.log(spike_variance)
+            - 0.5 * z.square() / spike_variance
+        )
+        new_r = torch.sigmoid((log_slab - log_spike).clamp(-30.0, 30.0))
+        new_r = torch.where(usable, new_r, torch.zeros_like(new_r))
+        updated_responsibilities[family] = new_r
+        if not update_global:
+            continue
+        target_pi = float(new_r[usable].mean().cpu())
+        target_pi = min(max(target_pi, 0.001), 0.999)
+        updated_inclusion[family] = (
+            (1.0 - config.damping) * pi + config.damping * target_pi
+        )
+        posterior_variance = 1.0 / (information + slab_scale**-2)
+        posterior_mean = posterior_variance * information * z
+        second_moment = posterior_mean.square() + posterior_variance
+        total_weight = new_r[usable].sum()
+        if float(total_weight.cpu()) > 1e-8:
+            target_scale = float(
+                torch.sqrt(
+                    (new_r[usable] * second_moment[usable]).sum() / total_weight
+                ).cpu()
+            )
+            target_scale = min(
+                max(target_scale, config.min_scale), config.max_scale
+            )
+            updated_scales[family] = (
+                (1.0 - config.damping) * slab_scale
+                + config.damping * target_scale
+            )
+    return updated_scales, updated_inclusion, updated_responsibilities
 
 
 def _sumzero_anchor_penalty(
@@ -683,6 +859,11 @@ def _fit_gene_chunk(
     disp_offset: np.ndarray | None = None,
     species_tax_node_groups: dict[str, list[list[int]]] | None = None,
     sumzero_anchor_mu: float = SUMZERO_ANCHOR_MU,
+    empirical_bayes: EmpiricalBayesConfig | None = None,
+    empirical_bayes_scales: dict[str, float] | None = None,
+    empirical_bayes_inclusion: dict[str, float] | None = None,
+    learn_empirical_bayes_scales: bool = False,
+    refit_all_species_tax: bool = False,
 ) -> dict[str, Any]:
     """Fit NB model for a chunk of genes.
 
@@ -739,6 +920,32 @@ def _fit_gene_chunk(
         k: torch.tensor(v, dtype=torch.float64, device=dev)
         for k, v in designs.items()
     }
+    eb_scales = (
+        dict(empirical_bayes_scales)
+        if empirical_bayes_scales is not None
+        else {
+            family: empirical_bayes.initial_scale
+            for family in designs
+            if empirical_bayes is not None and family.startswith("species_tax_")
+        }
+    )
+    eb_inclusion = (
+        dict(empirical_bayes_inclusion)
+        if empirical_bayes_inclusion is not None
+        else {family: empirical_bayes.initial_inclusion for family in eb_scales}
+        if empirical_bayes is not None
+        else {}
+    )
+    eb_responsibilities = {
+        family: torch.full_like(
+            betas[family],
+            1.0
+            if empirical_bayes is not None
+            and empirical_bayes.prior is ShrinkagePrior.SPIKE_SLAB
+            else eb_inclusion[family],
+        )
+        for family in eb_scales
+    }
 
     all_params = [alpha, log_theta] + list(betas.values())
     if gamma is not None:
@@ -766,13 +973,24 @@ def _fit_gene_chunk(
 
         loss = _nb_nll(Y, mu, theta)
 
-        # Penalty: Fisher-weighted L1 on ALL families (including species_tax_*).
+        # Nuisance and non-interaction families retain Fisher-weighted L1.
+        # Species-taxonomy families optionally use learned Gaussian/Laplace
+        # priors in common biological log-effect units.
         # Per-column L1 provides strong per-coefficient sparsity. Cross-level
         # balance is achieved by removing support promotion in _refit_support
         # (the original cause of the cascade).
         W = _compute_fisher_weights(mu.detach(), theta.detach())
         W_mean = W.mean(dim=1)
         for family, beta in betas.items():
+            if empirical_bayes is not None and family in eb_scales:
+                loss = loss + _empirical_bayes_penalty(
+                    beta=beta,
+                    prior=empirical_bayes.prior,
+                    scale=eb_scales[family],
+                    responsibilities=eb_responsibilities.get(family),
+                    spike_scale=empirical_bayes.spike_scale,
+                )
+                continue
             if isinstance(l1_lambdas, dict):
                 lam = l1_lambdas.get(family, 0.1)
             else:
@@ -804,6 +1022,22 @@ def _fit_gene_chunk(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(all_params, 5.0)
         optimizer.step()
+        if (
+            empirical_bayes is not None
+            and iteration >= empirical_bayes.warmup_iterations
+            and (iteration + 1) % empirical_bayes.update_interval == 0
+        ):
+            if (
+                empirical_bayes.prior is not ShrinkagePrior.SPIKE_SLAB
+                and learn_empirical_bayes_scales
+            ):
+                eb_scales = _update_empirical_bayes_scales(
+                    betas=betas,
+                    designs=design_tensors,
+                    W=W,
+                    scales=eb_scales,
+                    config=empirical_bayes,
+                )
         scheduler.step(loss.item())
 
         current_loss = loss.item()
@@ -814,6 +1048,44 @@ def _fit_gene_chunk(
             patience_counter += 1
             if patience_counter > 50:
                 break
+
+    if empirical_bayes is not None and empirical_bayes.prior is ShrinkagePrior.SPIKE_SLAB:
+        # Fit under the slab first, then perform mixture EB on the resulting
+        # approximately normal coefficient estimates. This avoids the local
+        # mode where a strong spike prevents a real coefficient escaping zero.
+        n_hyper_updates = 10 if learn_empirical_bayes_scales else 1
+        for _ in range(n_hyper_updates):
+            eb_scales, eb_inclusion, eb_responsibilities = _update_spike_slab_state(
+                betas=betas,
+                designs=design_tensors,
+                W=W,
+                scales=eb_scales,
+                inclusion=eb_inclusion,
+                responsibilities=eb_responsibilities,
+                config=empirical_bayes,
+                update_global=learn_empirical_bayes_scales,
+            )
+        if not learn_empirical_bayes_scales:
+            with torch.no_grad():
+                for family, slab_scale in eb_scales.items():
+                    beta = betas[family]
+                    information = design_tensors[family].square().T @ W
+                    usable = information > 1e-8
+                    z = torch.zeros_like(beta)
+                    z[usable] = beta[usable] * (
+                        information[usable] + slab_scale**-2
+                    ) / information[usable]
+                    slab_mean = information * z / (
+                        information + slab_scale**-2
+                    )
+                    spike_mean = information * z / (
+                        information + empirical_bayes.spike_scale**-2
+                    )
+                    responsibility = eb_responsibilities[family]
+                    beta.copy_(
+                        responsibility * slab_mean
+                        + (1.0 - responsibility) * spike_mean
+                    )
 
     # Extract results
     result_betas = {}
@@ -829,12 +1101,19 @@ def _fit_gene_chunk(
     # Post-selection refit if requested
     if refit_support:
         gamma_np = gamma.detach().cpu().numpy() if gamma is not None else None
-        result_betas, result_nonzero, gamma_np, refit_alpha, refit_log_theta = _refit_support(
-            Y_chunk, designs, library_sizes, result_betas, result_nonzero,
+        selection_nonzero = {family: mask.copy() for family, mask in result_nonzero.items()}
+        refit_nonzero = {family: mask.copy() for family, mask in result_nonzero.items()}
+        if refit_all_species_tax:
+            for family, mask in refit_nonzero.items():
+                if family.startswith("species_tax_"):
+                    mask[...] = True
+        result_betas, refit_nonzero, gamma_np, refit_alpha, refit_log_theta = _refit_support(
+            Y_chunk, designs, library_sizes, result_betas, refit_nonzero,
             max_iter // 2, device, gamma_init=gamma_np,
             species_tax_node_groups=species_tax_node_groups,
             sumzero_anchor_mu=sumzero_anchor_mu,
         )
+        result_nonzero = selection_nonzero
         alpha_np = refit_alpha
         log_theta_np = refit_log_theta
     else:
@@ -878,6 +1157,8 @@ def _fit_gene_chunk(
         "alpha": alpha_np,
         "log_theta": log_theta_np,
         "loss": best_loss,
+        "empirical_bayes_scales": eb_scales,
+        "empirical_bayes_inclusion": eb_inclusion,
     }
     if gamma_np is not None:
         result["gamma"] = gamma_np
@@ -1251,7 +1532,9 @@ def fit_tree_nb(
     dispersion_cell_offset: bool = True,
     progress: bool | str = True,
     keep_design_artifacts: bool = True,
-    orthogonal_tree: bool = False,
+    orthogonal_tree: bool = True,
+    empirical_bayes: EmpiricalBayesConfig | None = None,
+    refit_all_species_tax: bool = False,
 ) -> TreeNBResult:
     """Fit tree-structured NB regression on pseudobulk counts.
 
@@ -1280,7 +1563,8 @@ def fit_tree_nb(
         families. The Fisher-weighted column scaling and sqrt(2*log(p))
         family-size correction provide adaptive regularization, so a uniform
         lambda naturally prefers parsimonious (shallower) explanations.
-        If provided, overrides l1_lambdas. Default is 0.1.
+        If provided, overrides l1_lambdas. Defaults to the calibrated
+        ``DEFAULT_GLOBAL_LAMBDA = 0.05``.
     l1_lambdas : dict, optional
         Per-family penalty strengths (legacy interface). Ignored if
         global_lambda is provided.
@@ -1338,6 +1622,21 @@ def fit_tree_nb(
         compute dispersion-aware standard errors / p-values on the L1-selected
         coefficient support. Set False to save memory if you only need the
         coefficients themselves.
+    orthogonal_tree : bool, default True
+        Residualize each taxonomy and species-interaction level against all
+        earlier levels and restore column norms. This calibrated basis makes
+        fitted level contributions comparable. Pass False only to reproduce
+        legacy non-orthogonal fits.
+    empirical_bayes : EmpiricalBayesConfig, optional
+        Learn one Gaussian or Laplace prior scale per species-taxonomy level
+        from an evenly spaced pilot-gene panel, then hold those scales fixed
+        for the complete fit. Enabling this also enables orthogonal taxonomy
+        and interaction blocks so learned level burdens are comparable.
+    refit_all_species_tax : bool, default False
+        After ordinary L1 support selection, refit every orthogonal
+        ``species_tax_*`` coefficient without an L1 penalty. This relaxed
+        estimator is intended for donor-bootstrap evolutionary-burden
+        inference; selected-support metadata remains the original L1 support.
 
     Returns
     -------
@@ -1350,6 +1649,12 @@ def fit_tree_nb(
             "both explain unmodelled variance and can compete during fitting. "
             "Consider disabling one."
         )
+    if empirical_bayes is not None and not orthogonal_tree:
+        warnings.warn(
+            "empirical_bayes requires comparable taxonomy increments; "
+            "enabling orthogonal_tree=True."
+        )
+        orthogonal_tree = True
     # Determine penalty: global_lambda takes precedence
     penalty: float | dict[str, float]
     if global_lambda is not None:
@@ -1411,6 +1716,39 @@ def fit_tree_nb(
         cell_totals = X_full.sum(axis=1)
     library_sizes = np.asarray((P.T @ cell_totals)).ravel()
     pb.library_sizes = library_sizes
+
+    learned_eb_scales: dict[str, float] | None = None
+    learned_eb_inclusion: dict[str, float] | None = None
+    if empirical_bayes is not None:
+        n_pilot = min(empirical_bayes.pilot_genes, n_genes)
+        pilot_indices = np.unique(
+            np.linspace(0, n_genes - 1, num=n_pilot, dtype=np.int64)
+        )
+        if sparse.issparse(X_full):
+            X_pilot = X_full[:, pilot_indices]
+        else:
+            X_pilot = np.asarray(X_full)[:, pilot_indices]
+        Y_pilot = aggregate_chunk(X_pilot, pb.cell_to_group)
+        pilot_result = _fit_gene_chunk(
+            Y_pilot,
+            designs,
+            library_sizes,
+            active_lambdas,
+            empirical_bayes.pilot_max_iter,
+            device,
+            refit_support=False,
+            residual_lambda=residual_lambda,
+            species_tax_node_groups=species_tax_node_groups,
+            empirical_bayes=empirical_bayes,
+            learn_empirical_bayes_scales=True,
+            refit_all_species_tax=refit_all_species_tax,
+        )
+        learned_eb_scales = cast(
+            dict[str, float], pilot_result["empirical_bayes_scales"]
+        )
+        learned_eb_inclusion = cast(
+            dict[str, float], pilot_result["empirical_bayes_inclusion"]
+        )
 
     # Build dispersion designs (subset of mean designs, with masking).
     disp_designs: dict[str, np.ndarray] = {}
@@ -1501,6 +1839,10 @@ def fit_tree_nb(
             dispersion_lambda=disp_lambda,
             disp_offset=disp_offset,
             species_tax_node_groups=species_tax_node_groups,
+            empirical_bayes=empirical_bayes,
+            empirical_bayes_scales=learned_eb_scales,
+            empirical_bayes_inclusion=learned_eb_inclusion,
+            refit_all_species_tax=refit_all_species_tax,
         )
 
         for family in designs:
@@ -1614,6 +1956,16 @@ def fit_tree_nb(
         diagnostics["dispersion_active_cols_per_family"] = {
             f: int(len(idx)) for f, idx in disp_active_indices.items()
         }
+    if empirical_bayes is not None:
+        diagnostics["shrinkage_prior"] = empirical_bayes.prior.value
+        diagnostics["shrinkage_scales"] = learned_eb_scales
+        diagnostics["empirical_bayes_pilot_genes"] = min(
+            empirical_bayes.pilot_genes, n_genes
+        )
+        if empirical_bayes.prior is ShrinkagePrior.SPIKE_SLAB:
+            diagnostics["shrinkage_inclusion"] = learned_eb_inclusion
+            diagnostics["spike_scale"] = empirical_bayes.spike_scale
+    diagnostics["refit_all_species_tax"] = refit_all_species_tax
 
     return TreeNBResult(
         coefficients=final_coefficients,
@@ -1637,4 +1989,15 @@ def fit_tree_nb(
         dispersion_designs=(disp_designs if (keep_design_artifacts and disp_designs) else None),
         species_tax_meta=(species_tax_meta or None),
         species_tax_node_groups=(species_tax_node_groups or None),
+        shrinkage_prior=(
+            empirical_bayes.prior.value if empirical_bayes is not None else None
+        ),
+        shrinkage_scales=learned_eb_scales,
+        shrinkage_inclusion=(
+            learned_eb_inclusion
+            if empirical_bayes is not None
+            and empirical_bayes.prior is ShrinkagePrior.SPIKE_SLAB
+            else None
+        ),
+        orthogonal_tree=orthogonal_tree,
     )

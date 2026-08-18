@@ -1,4 +1,5 @@
 """Donor-honest post-selection intervals for species-by-taxonomy contrasts."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from scipy.stats import t as student_t
 from .inference import add_bh_qvalues
 from .model import fit_tree_nb
 from .results import TreeNBResult
+from .shrinkage import EmpiricalBayesConfig
 
 type FloatArray = NDArray[np.float64]
 
@@ -21,11 +23,13 @@ type FloatArray = NDArray[np.float64]
 class DonorSelectionConfig:
     """Configuration for the independent tree-model selection stage."""
 
-    global_lambda: float = 0.09
+    global_lambda: float = 0.05
     gene_chunk_size: int = 512
     max_iter: int = 500
     min_cells_per_pseudobulk: int = 10
     device: str = "cpu"
+    empirical_bayes: EmpiricalBayesConfig | None = None
+    localize_with_training_contrast: bool = True
 
 
 @dataclass
@@ -44,9 +48,7 @@ class DonorHonestContrastResult:
         return self.intervals[self.intervals["status"] == "ok"].copy()
 
 
-def _validate_donor_species(
-    *, obs: pd.DataFrame, donor_col: str, species_col: str
-) -> pd.DataFrame:
+def _validate_donor_species(*, obs: pd.DataFrame, donor_col: str, species_col: str) -> pd.DataFrame:
     """Return one species label per donor or raise for cross-species donors."""
     required = [donor_col, species_col]
     missing = [column for column in required if column not in obs.columns]
@@ -69,8 +71,12 @@ def _validate_donor_species(
 
 
 def _stratified_donor_split(
-    *, donor_species: pd.DataFrame, donor_col: str, species_col: str,
-    train_fraction: float, random_state: int
+    *,
+    donor_species: pd.DataFrame,
+    donor_col: str,
+    species_col: str,
+    train_fraction: float,
+    random_state: int,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Split donors independently within species for selection and inference."""
     if not 0.0 < train_fraction < 1.0:
@@ -93,15 +99,21 @@ def _stratified_donor_split(
     return tuple(sorted(training)), tuple(sorted(inference))
 
 
-def _selected_species_tax_candidates(
-    *, result: TreeNBResult, threshold: float
-) -> pd.DataFrame:
+def _selected_species_tax_candidates(*, result: TreeNBResult, threshold: float) -> pd.DataFrame:
     """Materialize interaction coefficients selected on training donors."""
     if result.species_tax_meta is None:
         return pd.DataFrame(
             columns=[
-                "family", "index", "gene_index", "gene", "level", "node_id",
-                "node_label", "species", "n_species_at_node", "selection_beta",
+                "family",
+                "index",
+                "gene_index",
+                "gene",
+                "level",
+                "node_id",
+                "node_label",
+                "species",
+                "n_species_at_node",
+                "selection_beta",
             ]
         )
     rows: list[dict[str, Any]] = []
@@ -129,9 +141,14 @@ def _selected_species_tax_candidates(
 
 
 def _donor_log_cpm(
-    *, adata: Any, cell_mask: NDArray[np.bool_], donor_col: str,
-    species_col: str, gene_index: int, counts_layer: str | None,
-    pseudocount: float
+    *,
+    adata: Any,
+    cell_mask: NDArray[np.bool_],
+    donor_col: str,
+    species_col: str,
+    gene_index: int,
+    counts_layer: str | None,
+    pseudocount: float,
 ) -> pd.DataFrame:
     """Aggregate a node's cells to donor-level log counts-per-million values."""
     obs = adata.obs.reset_index(drop=True)
@@ -162,8 +179,13 @@ def _donor_log_cpm(
 
 
 def _welch_contrast(
-    *, donor_values: pd.DataFrame, donor_col: str, species_col: str,
-    target_species: str, expected_species: Sequence[str], confidence_level: float
+    *,
+    donor_values: pd.DataFrame,
+    donor_col: str,
+    species_col: str,
+    target_species: str,
+    expected_species: Sequence[str],
+    confidence_level: float,
 ) -> dict[str, float | int | str]:
     """Estimate one species-versus-mean-of-others donor-level contrast."""
     available = set(donor_values[species_col].astype(str))
@@ -174,9 +196,9 @@ def _welch_contrast(
     variances: dict[str, float] = {}
     sizes: dict[str, int] = {}
     for species in expected_species:
-        values = donor_values.loc[
-            donor_values[species_col] == species, "log_cpm"
-        ].to_numpy(dtype=float)
+        values = donor_values.loc[donor_values[species_col] == species, "log_cpm"].to_numpy(
+            dtype=float
+        )
         if values.size < 2:
             return {"status": "insufficient_inference_donors"}
         means[species] = float(np.mean(values))
@@ -189,8 +211,7 @@ def _welch_contrast(
     estimate = means[target_species] - other_mean
     variance_terms = [variances[target_species] / sizes[target_species]]
     variance_terms.extend(
-        variances[species] / (sizes[species] * len(other_species) ** 2)
-        for species in other_species
+        variances[species] / (sizes[species] * len(other_species) ** 2) for species in other_species
     )
     variance = float(np.sum(variance_terms))
     if not np.isfinite(variance) or variance <= 0.0:
@@ -220,6 +241,61 @@ def _welch_contrast(
         "n_target_donors": sizes[target_species],
         "n_other_donors": int(sum(sizes[species] for species in other_species)),
     }
+
+
+def _score_training_candidates(
+    *,
+    adata: Any,
+    candidates: pd.DataFrame,
+    taxonomy_cols: tuple[str, ...],
+    donor_col: str,
+    species_col: str,
+    counts_layer: str | None,
+    pseudocount: float,
+) -> pd.DataFrame:
+    """Score candidates by their selection-donor contrast.
+
+    This ranking uses only the selection donors, so it cannot invalidate the
+    held-out interval or its p-value. It makes node localization match the
+    donor-level estimand rather than a post-refit coefficient magnitude.
+    """
+    obs = adata.obs.reset_index(drop=True)
+    species = tuple(sorted(obs[species_col].astype(str).unique()))
+    ancestor_by_level = {
+        level: obs[list(taxonomy_cols[: index + 1])].astype(str).agg("/".join, axis=1)
+        for index, level in enumerate(taxonomy_cols)
+    }
+    scores: list[float] = []
+    for candidate in candidates.to_dict("records"):
+        node_mask = (
+            ancestor_by_level[str(candidate["level"])] == str(candidate["node_id"])
+        ).to_numpy()
+        values = _donor_log_cpm(
+            adata=adata,
+            cell_mask=node_mask,
+            donor_col=donor_col,
+            species_col=species_col,
+            gene_index=int(candidate["gene_index"]),
+            counts_layer=counts_layer,
+            pseudocount=pseudocount,
+        )
+        contrast = _welch_contrast(
+            donor_values=values,
+            donor_col=donor_col,
+            species_col=species_col,
+            target_species=str(candidate["species"]),
+            expected_species=species,
+            confidence_level=0.95,
+        )
+        scores.append(abs(float(contrast.get("estimate", 0.0))))
+    ranked = candidates.assign(selection_contrast_score=scores)
+    keys = ["family", "level", "species", "gene"]
+    ranked["selection_contrast_rank"] = (
+        ranked.groupby(keys)["selection_contrast_score"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    return ranked
 
 
 def donor_honest_intervals(
@@ -290,10 +366,21 @@ def donor_honest_intervals(
         fit_dispersion_tree=False,
         progress=False,
         keep_design_artifacts=False,
+        empirical_bayes=selection.empirical_bayes,
     )
     candidates = _selected_species_tax_candidates(
         result=selection_result, threshold=selection_threshold
     )
+    if not candidates.empty and selection.localize_with_training_contrast:
+        candidates = _score_training_candidates(
+            adata=training_data,
+            candidates=candidates,
+            taxonomy_cols=taxonomy_columns,
+            donor_col=donor_col,
+            species_col=species_col,
+            counts_layer=counts_layer,
+            pseudocount=pseudocount,
+        )
     if candidates.empty:
         candidates["status"] = pd.Series(dtype=str)
         candidates["q"] = pd.Series(dtype=float)

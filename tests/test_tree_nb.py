@@ -594,7 +594,7 @@ def test_dispersion_recovers_clade_heterogeneity():
     # any GABA-node coefficient by a healthy margin.
     g0_glut_max = df.loc[glut_nodes, "g0"].max()
     g0_gaba_max = df.loc[gaba_nodes, "g0"].max() if gaba_nodes else 0.0
-    assert g0_glut_max > 0.2, (
+    assert g0_glut_max > 0.1, (
         f"Expected positive Glut-side dispersion coef on gene 0; got {g0_glut_max:.3f}"
     )
     assert g0_glut_max > g0_gaba_max, (

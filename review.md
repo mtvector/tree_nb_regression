@@ -475,3 +475,65 @@ The fundamental fix (LRT-based tree-level inference that handles the
 non-identifiability properly, or a re-parameterization that breaks the
 nested aliasing) is a larger architectural change beyond the scope of
 this iteration cycle.
+
+### D3. Level-specific empirical-Bayes calibration
+
+The taxonomy basis now has an opt-in full earlier-level residualization:
+every level is projected off the span of all earlier levels, and each residual
+column is restored to its original L2 norm. The same transform is applied to
+`species_tax_*` blocks after removing taxonomy/species nuisance spans. EB fits
+enable this automatically.
+
+Raw coefficient vectors remain redundant within sibling/species contrast
+spaces, so level comparisons use the invariant fitted contribution
+`X_level @ beta_level`. Normalized evolutionary burden is its mean square over
+observed pseudobulks and genes. Synthetic truths are canonicalized to the
+minimum-norm sum-to-zero coordinates before coefficient scoring.
+
+Thirty known-truth simulations per dense-small/sparse-large regime and 100
+donor-split coverage replicates gave:
+
+| method | mean magnitude error | mean log-burden error | donor localization | null coverage | null rejection |
+|---|---:|---:|---:|---:|---:|
+| fixed L1 | 0.022 | 0.029 | 0.88 | 0.963 | 0.037 |
+| Gaussian EB | 0.062 | 0.147 | 0.77 | 0.960 | 0.040 |
+| Laplace EB | 0.067 | 0.100 | 0.81 | 0.960 | 0.040 |
+| spike-and-slab EB | 0.054 | 0.084 | 0.77 | 0.960 | 0.040 |
+
+All methods localized the known changes in the balanced reconstruction
+simulations. Fixed L1 remains the strongest point-reconstruction baseline.
+Spike-and-slab is selected only among EB priors because it best balances dense
+and sparse burden recovery while exposing a learned change prevalence and slab
+magnitude. EB therefore remains opt-in for comparative level-burden analyses;
+it does not replace donor-honest held-out intervals or the default L1 fit.
+
+### D4. Fixed-L1 tuning and legacy-basis comparison
+
+A subsequent 30-simulation comparison selected the L1 penalty by mean
+negative-binomial likelihood on two unseen donors per species. The selection
+stage did not use planted coefficients. Final recovery was measured from each
+level's fitted contribution `X_level @ beta_level`, making legacy and
+orthogonal coordinates directly comparable.
+
+The prespecified grid was `0.005, 0.01, 0.02, 0.05, 0.09, 0.15, 0.30`.
+Pooled validation selected `0.15` for both bases. Relative to `0.05`, the
+orthogonal tuned fit improved held-out NLL by 0.0117 per observation (paired
+95% CI 0.0046 to 0.0189). Its advantage over `0.09` was only 0.0028 (95% CI
+-0.0006 to 0.0062), so the fine distinction between 0.09 and 0.15 is not
+resolved.
+
+| method | normalized effect RMSE | mean absolute log-burden error | combined score |
+|---|---:|---:|---:|
+| orthogonal L1, fixed 0.05 | 0.126 | 0.026 | 0.162 |
+| orthogonal L1, tuned 0.15 | 0.113 | 0.047 | 0.167 |
+| spike-and-slab EB | 0.107 | 0.094 | 0.207 |
+| Laplace EB | 0.108 | 0.106 | 0.220 |
+| Gaussian EB | 0.154 | 0.156 | 0.320 |
+| legacy L1, historical 0.09 | 0.472 | 1.263 | 1.856 |
+| legacy L1, tuned 0.15 | 0.470 | 1.764 | 2.340 |
+
+Thus orthogonalization is the dominant improvement. Predictively tuned L1 is
+the better point-effect estimator than fixed 0.05, whereas fixed 0.05 is the
+better evolutionary-burden estimator. Spike-and-slab has the lowest
+sparse-large normalized effect RMSE (0.101 versus 0.110 for tuned orthogonal
+L1), but its sparse burden is more attenuated (ratio 0.868 versus 0.964).

@@ -48,6 +48,12 @@ class TreeNBResult:
     # compute_wald_significance to augment the Hessian and by post-processing
     # to project coefficients onto the constraint subspace exactly.
     species_tax_node_groups: dict[str, list[list[int]]] | None = None
+    # Level-specific empirical-Bayes prior learned on pilot genes. Gaussian
+    # values are standard deviations; Laplace values are scale parameters.
+    shrinkage_prior: str | None = None
+    shrinkage_scales: dict[str, float] | None = None
+    shrinkage_inclusion: dict[str, float] | None = None
+    orthogonal_tree: bool = False
 
     @property
     def n_genes(self) -> int:

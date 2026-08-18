@@ -1,4 +1,5 @@
 """Simulation harness for donor-honest tree-contrast calibration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -71,7 +72,9 @@ def _make_calibration_adata(*, seed: int, n_donors_per_species: int) -> ad.AnnDa
                                 "batch": f"batch_{donor_index % 2}",
                             }
                         )
-    adata = ad.AnnData(X=sparse.csr_matrix(np.asarray(counts, dtype=np.int64)), obs=pd.DataFrame(rows))
+    adata = ad.AnnData(
+        X=sparse.csr_matrix(np.asarray(counts, dtype=np.int64)), obs=pd.DataFrame(rows)
+    )
     adata.var_names = ["signal", "null", "background"]
     return adata
 
@@ -94,10 +97,7 @@ def run_donor_honest_calibration(
     n_simulations: int = 100,
     n_donors_per_species: int = 12,
     random_state: int = 0,
-    selection: DonorSelectionConfig = DonorSelectionConfig(
-        global_lambda=0.01,
-        max_iter=120,
-    ),
+    selection: DonorSelectionConfig = DonorSelectionConfig(max_iter=120),
 ) -> CalibrationSummary:
     """Evaluate held-out interval calibration and tree localization end to end.
 
@@ -127,7 +127,6 @@ def run_donor_honest_calibration(
             donor_col="donor",
             batch_col="batch",
             selection=selection,
-            selection_threshold=1e-6,
             random_state=int(rng.integers(0, np.iinfo(np.int32).max)),
         )
         signal_row = _target_row(intervals=result.intervals, gene="signal", node_id="A")
@@ -139,17 +138,19 @@ def run_donor_honest_calibration(
             & (result.intervals["species"] == "Human")
             & (result.intervals["gene"] == "signal")
         ]
-        beta_a = class_signal.loc[class_signal["node_id"] == "A", "selection_beta"]
-        beta_b = class_signal.loc[class_signal["node_id"] == "B", "selection_beta"]
+        score_column = (
+            "selection_contrast_score"
+            if "selection_contrast_score" in class_signal
+            else "selection_beta"
+        )
+        beta_a = class_signal.loc[class_signal["node_id"] == "A", score_column]
+        beta_b = class_signal.loc[class_signal["node_id"] == "B", score_column]
         # Correct localization means that the true Class-A signal is retained
         # and is stronger than Class B if B was selected at all. Penalized
         # selection is allowed to omit the null Class-B coefficient.
         localized = bool(
             len(beta_a) == 1
-            and (
-                len(beta_b) == 0
-                or abs(float(beta_a.iloc[0])) > abs(float(beta_b.iloc[0]))
-            )
+            and (len(beta_b) == 0 or abs(float(beta_a.iloc[0])) > abs(float(beta_b.iloc[0])))
         )
         for label, truth, row in (
             ("signal", true_signal_contrast, signal_row),
@@ -192,7 +193,9 @@ def run_donor_honest_calibration(
         signal_coverage=float(signal["covered"].mean()) if len(signal) else float("nan"),
         null_coverage=float(null["covered"].mean()) if len(null) else float("nan"),
         null_rejection_rate=float((null["p"] < 0.05).mean()) if len(null) else float("nan"),
-        localization_rate=float(localization["localized"].mean()) if len(localization) else float("nan"),
+        localization_rate=float(localization["localized"].mean())
+        if len(localization)
+        else float("nan"),
         selection_rate=float(frame["selected"].mean()) if len(frame) else float("nan"),
         records=frame,
     )

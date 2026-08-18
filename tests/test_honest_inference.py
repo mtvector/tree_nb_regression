@@ -45,6 +45,8 @@ def test_donor_honest_intervals_hold_out_complete_donors() -> None:
     assert row["ci_lo"] < row["estimate"] < row["ci_hi"]
     assert row["estimate"] > 0.0
     assert row["n_target_donors"] == 4
+    assert row["selection_contrast_score"] > 0.0
+    assert row["selection_contrast_rank"] >= 1
 
 
 def test_welch_contrast_has_nominal_null_calibration() -> None:
@@ -80,4 +82,3 @@ def test_welch_contrast_has_nominal_null_calibration() -> None:
     null_rejection = float(np.mean(rejected))
     assert 0.90 <= coverage <= 0.975
     assert null_rejection <= 0.06
-

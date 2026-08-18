@@ -52,8 +52,12 @@ strict = true
 files = [
     "__init__.py",
     "calibration.py",
+    "burden_inference.py",
+    "burden_calibration.py",
+    "eb_calibration.py",
     "honest_inference.py",
     "inference.py",
+    "l1_tuning.py",
     "model.py",
     "pseudobulk.py",
     "results.py",
