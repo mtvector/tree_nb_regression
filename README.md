@@ -147,8 +147,61 @@ synthetic recovery tests. Important limitations remain:
 - penalty calibration is gene-chunk dependent.
 
 The empirical simulation summarized in `review.md` found inflated Type-I error
-for several inner taxonomy levels and nuisance families. Use `p` and `q` only
-as screening diagnostics until donor-aware, identifiable inference is added.
+for several inner taxonomy levels and nuisance families. Use the legacy Wald
+`p` and `q` values only as screening diagnostics; use the donor-honest workflow
+below for the currently validated discovery contrast.
+
+## Donor-honest post-selection intervals
+
+`donor_honest_intervals` is the supported route for discovery-oriented
+species-by-taxonomy inference. It splits **whole donors within each species**:
+the training donors localize `species_tax_*` candidates, while the disjoint
+inference donors estimate an identifiable contrast and its interval.
+
+```python
+from tree_nb_regression import DonorSelectionConfig, donor_honest_intervals
+
+honest = donor_honest_intervals(
+    adata,
+    taxonomy_cols=("Neighborhood", "Class_V2", "Subclass_V2", "Group_V2", "final_cluster"),
+    species_col="species",
+    species_tree="(Mouse,((Macaque_mulatta,Macaque_nemestrina),Human));",
+    donor_col="donor_name",
+    counts_layer="UMIs",
+    selection=DonorSelectionConfig(global_lambda=0.01, max_iter=500),
+    random_state=41,
+)
+discoveries = honest.discoverable.query("q < 0.05")
+```
+
+Each returned interval estimates a species' mean donor-level log counts per
+million within a taxonomy node minus the equally weighted mean of the other
+species at that node. It is deliberately **not** an interval for a raw
+path-indicator coefficient. The held-out `p` values are valid conditional on
+the training-donor screen; `q` is BH-adjusted across the selected held-out
+contrasts.
+
+At least four donors per species are required to form a split with two
+held-out donors, but this is a minimum for computation rather than a strong
+design. The included calibration uses 12 donors per species. A batch perfectly
+confounded with species remains non-identifiable, even with donor splitting.
+
+Run the end-to-end calibration before changing this workflow:
+
+```bash
+python - <<'PY'
+import json
+from tree_nb_regression import run_donor_honest_calibration
+
+summary = run_donor_honest_calibration(n_simulations=300, random_state=202)
+print(json.dumps(summary.__dict__ | {"records": "omitted"}, indent=2, default=str))
+PY
+```
+
+For the committed simulator and seed, the 300-replicate run is expected to
+have nominal-95% coverage between 90% and 97.5%, null rejection at or below
+6%, and correct Class-A localization in at least 70% of screens. Calibration
+records belong in `/results`, not the repository.
 
 ## Repository layout
 

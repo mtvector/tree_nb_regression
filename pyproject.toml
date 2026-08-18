@@ -32,7 +32,10 @@ packages = ["tree_nb_regression"]
 tree_nb_regression = "."
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not slow'"
+markers = [
+    "slow: end-to-end simulation calibration gate",
+]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -48,6 +51,8 @@ python_version = "3.12"
 strict = true
 files = [
     "__init__.py",
+    "calibration.py",
+    "honest_inference.py",
     "inference.py",
     "model.py",
     "pseudobulk.py",

@@ -1,5 +1,11 @@
 """Tree-structured pseudobulk negative-binomial regression."""
 
+from .calibration import CalibrationSummary, run_donor_honest_calibration
+from .honest_inference import (
+    DonorHonestContrastResult,
+    DonorSelectionConfig,
+    donor_honest_intervals,
+)
 from .inference import add_bh_qvalues, compute_wald_significance
 from .model import DEFAULT_GLOBAL_LAMBDA, fit_tree_nb
 from .pseudobulk import build_pseudobulk
@@ -16,4 +22,9 @@ __all__ = [
     "TreeNBResult",
     "compute_wald_significance",
     "add_bh_qvalues",
+    "DonorHonestContrastResult",
+    "DonorSelectionConfig",
+    "donor_honest_intervals",
+    "CalibrationSummary",
+    "run_donor_honest_calibration",
 ]
