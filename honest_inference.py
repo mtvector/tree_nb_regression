@@ -148,6 +148,7 @@ def _donor_log_cpm(
     species_col: str,
     gene_index: int,
     counts_layer: str | None,
+    library_size_col: str | None = None,
     pseudocount: float,
 ) -> pd.DataFrame:
     """Aggregate a node's cells to donor-level log counts-per-million values."""
@@ -157,12 +158,21 @@ def _donor_log_cpm(
         return pd.DataFrame(columns=[donor_col, species_col, "log_cpm"])
     X = adata.layers[counts_layer] if counts_layer is not None else adata.X
     X_node = X[cell_mask]
-    if sparse.issparse(X_node):
+    if library_size_col is not None:
+        library_sizes = np.asarray(
+            adata.obs.loc[cell_mask, library_size_col], dtype=np.float64
+        )
+        if not np.isfinite(library_sizes).all() or (library_sizes < 0).any():
+            raise ValueError("library_size_col must contain finite nonnegative values.")
+    elif sparse.issparse(X_node):
         library_sizes = np.asarray(X_node.sum(axis=1)).ravel()
-        gene_counts = np.asarray(X_node[:, gene_index].toarray()).ravel()
     else:
         dense_node = np.asarray(X_node)
         library_sizes = dense_node.sum(axis=1)
+    if sparse.issparse(X_node):
+        gene_counts = np.asarray(X_node[:, gene_index].toarray()).ravel()
+    else:
+        dense_node = np.asarray(X_node)
         gene_counts = dense_node[:, gene_index]
     frame = selected_obs.copy()
     frame["library_size"] = library_sizes
@@ -243,6 +253,257 @@ def _welch_contrast(
     }
 
 
+def _candidate_contrasts(
+    *,
+    adata: Any,
+    candidates: pd.DataFrame,
+    taxonomy_cols: tuple[str, ...],
+    donor_col: str,
+    species_col: str,
+    counts_layer: str | None,
+    library_size_col: str | None,
+    cell_mask: NDArray[np.bool_],
+    expected_species: tuple[str, ...],
+    confidence_level: float,
+    pseudocount: float,
+) -> pd.DataFrame:
+    """Vectorize donor-level contrasts over selected node-gene candidates.
+
+    Cells are aggregated once per taxonomy level into donor-by-node
+    pseudobulks. Species moments and Welch contrasts are then evaluated in
+    arrays without changing the scalar estimand implemented by
+    :func:`_donor_log_cpm` and :func:`_welch_contrast`.
+    """
+    n_candidates = len(candidates)
+    result_columns = {
+        "status": np.full(n_candidates, "species_absent_at_node", dtype=object),
+        "estimate": np.full(n_candidates, np.nan, dtype=np.float64),
+        "se": np.full(n_candidates, np.nan, dtype=np.float64),
+        "df": np.full(n_candidates, np.nan, dtype=np.float64),
+        "ci_lo": np.full(n_candidates, np.nan, dtype=np.float64),
+        "ci_hi": np.full(n_candidates, np.nan, dtype=np.float64),
+        "statistic": np.full(n_candidates, np.nan, dtype=np.float64),
+        "p": np.full(n_candidates, np.nan, dtype=np.float64),
+        "n_target_donors": np.full(n_candidates, np.nan, dtype=np.float64),
+        "n_other_donors": np.full(n_candidates, np.nan, dtype=np.float64),
+    }
+    if n_candidates == 0:
+        return pd.DataFrame(result_columns)
+    if cell_mask.shape != (adata.n_obs,):
+        raise ValueError("cell_mask must have one Boolean value per observation.")
+
+    selected_indices = np.flatnonzero(cell_mask)
+    selected_obs = adata.obs.iloc[selected_indices].reset_index(drop=True)
+    counts = adata.layers[counts_layer] if counts_layer is not None else adata.X
+    if library_size_col is not None:
+        selected_library_sizes = np.asarray(
+            adata.obs.iloc[selected_indices][library_size_col], dtype=np.float64
+        )
+    else:
+        selected_counts = counts[selected_indices]
+        if sparse.issparse(selected_counts):
+            selected_library_sizes = np.asarray(selected_counts.sum(axis=1)).ravel()
+        else:
+            selected_library_sizes = np.asarray(selected_counts).sum(axis=1)
+    if (
+        not np.isfinite(selected_library_sizes).all()
+        or (selected_library_sizes < 0).any()
+    ):
+        raise ValueError("library_size_col must contain finite nonnegative values.")
+
+    species_to_index = {
+        species: index for index, species in enumerate(expected_species)
+    }
+    candidate_levels = candidates["level"].astype(str).to_numpy()
+    candidate_nodes = candidates["node_id"].astype(str).to_numpy()
+    candidate_genes = candidates["gene_index"].to_numpy(dtype=np.int64)
+    candidate_species = candidates["species"].astype(str).to_numpy()
+
+    for level_index, level in enumerate(taxonomy_cols):
+        candidate_positions = np.flatnonzero(candidate_levels == level)
+        if candidate_positions.size == 0:
+            continue
+        level_candidates = candidates.iloc[candidate_positions]
+        node_ids = sorted(level_candidates["node_id"].astype(str).unique())
+        gene_indices = np.sort(
+            level_candidates["gene_index"].to_numpy(dtype=np.int64)
+        )
+        gene_indices = np.unique(gene_indices)
+        node_to_index = {node_id: index for index, node_id in enumerate(node_ids)}
+        gene_to_index = {
+            int(gene_index): index for index, gene_index in enumerate(gene_indices)
+        }
+
+        cell_nodes = (
+            selected_obs[list(taxonomy_cols[: level_index + 1])]
+            .astype(str)
+            .agg("/".join, axis=1)
+        )
+        relevant_cells = cell_nodes.isin(node_ids).to_numpy()
+        if not relevant_cells.any():
+            continue
+        level_obs = selected_obs.loc[
+            relevant_cells, [donor_col, species_col]
+        ].astype(str)
+        level_nodes = cell_nodes.loc[relevant_cells].astype(str)
+        keys = list(
+            zip(
+                level_nodes,
+                level_obs[donor_col],
+                level_obs[species_col],
+                strict=True,
+            )
+        )
+        key_array = np.empty(len(keys), dtype=object)
+        key_array[:] = keys
+        group_codes, unique_keys = pd.factorize(key_array, sort=True)
+        assignment = sparse.csr_matrix(
+            (
+                np.ones(len(group_codes), dtype=np.float64),
+                (group_codes, np.arange(len(group_codes))),
+            ),
+            shape=(len(unique_keys), len(group_codes)),
+        )
+        relevant_selected_indices = selected_indices[relevant_cells]
+        level_counts = counts[relevant_selected_indices][:, gene_indices]
+        donor_node_counts = assignment @ level_counts
+        if sparse.issparse(donor_node_counts):
+            donor_node_counts_array = donor_node_counts.toarray()
+        else:
+            donor_node_counts_array = np.asarray(donor_node_counts)
+        donor_node_library_sizes = np.asarray(
+            assignment @ selected_library_sizes[relevant_cells]
+        ).ravel()
+        log_cpm = np.log(
+            (donor_node_counts_array + pseudocount)
+            / (donor_node_library_sizes[:, None] + pseudocount)
+            * 1_000_000.0
+        )
+
+        aggregate_nodes = np.asarray(
+            [str(key[0]) for key in unique_keys], dtype=object
+        )
+        aggregate_species = np.asarray(
+            [str(key[2]) for key in unique_keys], dtype=object
+        )
+        n_nodes = len(node_ids)
+        n_species = len(expected_species)
+        n_genes = len(gene_indices)
+        means = np.full((n_nodes, n_species, n_genes), np.nan, dtype=np.float64)
+        variances = np.full_like(means, np.nan)
+        sizes = np.zeros((n_nodes, n_species), dtype=np.int64)
+        for node_id, node_position in node_to_index.items():
+            node_rows = aggregate_nodes == node_id
+            for species, species_position in species_to_index.items():
+                rows = node_rows & (aggregate_species == species)
+                size = int(rows.sum())
+                sizes[node_position, species_position] = size
+                if size == 0:
+                    continue
+                values = log_cpm[rows]
+                means[node_position, species_position] = np.mean(values, axis=0)
+                if size >= 2:
+                    variances[node_position, species_position] = np.var(
+                        values, axis=0, ddof=1
+                    )
+
+        level_node_indices = np.asarray(
+            [node_to_index[str(node)] for node in candidate_nodes[candidate_positions]],
+            dtype=np.int64,
+        )
+        level_gene_indices = np.asarray(
+            [gene_to_index[int(gene)] for gene in candidate_genes[candidate_positions]],
+            dtype=np.int64,
+        )
+        level_target_indices = np.asarray(
+            [species_to_index.get(str(species), -1) for species in candidate_species[candidate_positions]],
+            dtype=np.int64,
+        )
+        level_sizes = sizes[level_node_indices]
+        present = np.all(level_sizes > 0, axis=1) & (level_target_indices >= 0)
+        result_columns["status"][candidate_positions[present]] = (
+            "insufficient_inference_donors"
+        )
+        sufficient = present & np.all(level_sizes >= 2, axis=1)
+        if n_species < 2:
+            result_columns["status"][candidate_positions[sufficient]] = (
+                "no_comparison_species"
+            )
+            continue
+        if not sufficient.any():
+            continue
+
+        sufficient_local = np.flatnonzero(sufficient)
+        output_positions = candidate_positions[sufficient_local]
+        node_take = level_node_indices[sufficient_local]
+        gene_take = level_gene_indices[sufficient_local]
+        target_take = level_target_indices[sufficient_local]
+        means_take = means[node_take, :, gene_take]
+        variances_take = variances[node_take, :, gene_take]
+        sizes_take = level_sizes[sufficient_local]
+        row_indices = np.arange(len(output_positions))
+        target_means = means_take[row_indices, target_take]
+        target_variances = variances_take[row_indices, target_take]
+        target_sizes = sizes_take[row_indices, target_take]
+        n_other_species = n_species - 1
+        other_means = (
+            np.sum(means_take, axis=1) - target_means
+        ) / n_other_species
+        estimates = target_means - other_means
+        variance_per_donor = variances_take / sizes_take
+        target_terms = target_variances / target_sizes
+        variance = target_terms + (
+            np.sum(variance_per_donor, axis=1) - target_terms
+        ) / n_other_species**2
+
+        other_terms = variance_per_donor / n_other_species**2
+        other_terms[row_indices, target_take] = 0.0
+        denominator = target_terms**2 / (target_sizes - 1)
+        denominator += np.sum(
+            other_terms**2 / (sizes_take - 1), axis=1
+        )
+        valid_variance = (
+            np.isfinite(variance)
+            & (variance > 0.0)
+            & np.isfinite(denominator)
+            & (denominator > 0.0)
+        )
+        result_columns["status"][output_positions] = "degenerate_donor_variance"
+        if not valid_variance.any():
+            continue
+
+        valid_output = output_positions[valid_variance]
+        valid_estimates = estimates[valid_variance]
+        valid_variance_values = variance[valid_variance]
+        valid_denominator = denominator[valid_variance]
+        degrees_freedom = valid_variance_values**2 / valid_denominator
+        standard_errors = np.sqrt(valid_variance_values)
+        critical = student_t.ppf(
+            (1.0 + confidence_level) / 2.0, degrees_freedom
+        )
+        statistics = valid_estimates / standard_errors
+        p_values = 2.0 * student_t.sf(np.abs(statistics), degrees_freedom)
+        result_columns["status"][valid_output] = "ok"
+        result_columns["estimate"][valid_output] = valid_estimates
+        result_columns["se"][valid_output] = standard_errors
+        result_columns["df"][valid_output] = degrees_freedom
+        result_columns["ci_lo"][valid_output] = (
+            valid_estimates - critical * standard_errors
+        )
+        result_columns["ci_hi"][valid_output] = (
+            valid_estimates + critical * standard_errors
+        )
+        result_columns["statistic"][valid_output] = statistics
+        result_columns["p"][valid_output] = p_values
+        result_columns["n_target_donors"][valid_output] = target_sizes[valid_variance]
+        result_columns["n_other_donors"][valid_output] = (
+            np.sum(sizes_take[valid_variance], axis=1)
+            - target_sizes[valid_variance]
+        )
+
+    return pd.DataFrame(result_columns)
+
+
 def _score_training_candidates(
     *,
     adata: Any,
@@ -251,6 +512,7 @@ def _score_training_candidates(
     donor_col: str,
     species_col: str,
     counts_layer: str | None,
+    library_size_col: str | None,
     pseudocount: float,
 ) -> pd.DataFrame:
     """Score candidates by their selection-donor contrast.
@@ -259,35 +521,21 @@ def _score_training_candidates(
     held-out interval or its p-value. It makes node localization match the
     donor-level estimand rather than a post-refit coefficient magnitude.
     """
-    obs = adata.obs.reset_index(drop=True)
-    species = tuple(sorted(obs[species_col].astype(str).unique()))
-    ancestor_by_level = {
-        level: obs[list(taxonomy_cols[: index + 1])].astype(str).agg("/".join, axis=1)
-        for index, level in enumerate(taxonomy_cols)
-    }
-    scores: list[float] = []
-    for candidate in candidates.to_dict("records"):
-        node_mask = (
-            ancestor_by_level[str(candidate["level"])] == str(candidate["node_id"])
-        ).to_numpy()
-        values = _donor_log_cpm(
-            adata=adata,
-            cell_mask=node_mask,
-            donor_col=donor_col,
-            species_col=species_col,
-            gene_index=int(candidate["gene_index"]),
-            counts_layer=counts_layer,
-            pseudocount=pseudocount,
-        )
-        contrast = _welch_contrast(
-            donor_values=values,
-            donor_col=donor_col,
-            species_col=species_col,
-            target_species=str(candidate["species"]),
-            expected_species=species,
-            confidence_level=0.95,
-        )
-        scores.append(abs(float(contrast.get("estimate", 0.0))))
+    species = tuple(sorted(adata.obs[species_col].astype(str).unique()))
+    contrasts = _candidate_contrasts(
+        adata=adata,
+        candidates=candidates,
+        taxonomy_cols=taxonomy_cols,
+        donor_col=donor_col,
+        species_col=species_col,
+        counts_layer=counts_layer,
+        library_size_col=library_size_col,
+        cell_mask=np.ones(adata.n_obs, dtype=bool),
+        expected_species=species,
+        confidence_level=0.95,
+        pseudocount=pseudocount,
+    )
+    scores = contrasts["estimate"].fillna(0.0).abs().to_numpy()
     ranked = candidates.assign(selection_contrast_score=scores)
     keys = ["family", "level", "species", "gene"]
     ranked["selection_contrast_rank"] = (
@@ -306,6 +554,7 @@ def donor_honest_intervals(
     species_tree: str | tuple[Any, ...],
     donor_col: str,
     counts_layer: str | None = None,
+    library_size_col: str | None = None,
     batch_col: str | None = None,
     selection: DonorSelectionConfig = DonorSelectionConfig(),
     train_fraction: float = 0.5,
@@ -335,6 +584,8 @@ def donor_honest_intervals(
         raise KeyError(f"obs is missing required columns: {missing_columns}")
     if counts_layer is not None and counts_layer not in adata.layers:
         raise KeyError(f"counts layer '{counts_layer}' was not found.")
+    if library_size_col is not None and library_size_col not in adata.obs:
+        raise KeyError(f"library-size column '{library_size_col}' was not found in obs.")
 
     donor_species = _validate_donor_species(
         obs=adata.obs, donor_col=donor_col, species_col=species_col
@@ -357,6 +608,7 @@ def donor_honest_intervals(
         batch_col=batch_col,
         donor_col=donor_col,
         counts_layer=counts_layer,
+        library_size_col=library_size_col,
         gene_chunk_size=selection.gene_chunk_size,
         min_cells_per_pseudobulk=selection.min_cells_per_pseudobulk,
         global_lambda=selection.global_lambda,
@@ -379,6 +631,7 @@ def donor_honest_intervals(
             donor_col=donor_col,
             species_col=species_col,
             counts_layer=counts_layer,
+            library_size_col=library_size_col,
             pseudocount=pseudocount,
         )
     if candidates.empty:
@@ -391,34 +644,23 @@ def donor_honest_intervals(
             inference_donors=inference_donors,
         )
 
-    obs = adata.obs.reset_index(drop=True)
     all_species = tuple(sorted(donor_species[species_col].astype(str).unique()))
-    ancestor_by_level = {
-        level: obs[list(taxonomy_columns[: index + 1])].astype(str).agg("/".join, axis=1)
-        for index, level in enumerate(taxonomy_columns)
-    }
-    rows: list[dict[str, Any]] = []
-    for candidate in candidates.to_dict("records"):
-        node_mask = (ancestor_by_level[candidate["level"]] == candidate["node_id"]).to_numpy()
-        donor_values = _donor_log_cpm(
-            adata=adata,
-            cell_mask=node_mask & inference_mask,
-            donor_col=donor_col,
-            species_col=species_col,
-            gene_index=int(candidate["gene_index"]),
-            counts_layer=counts_layer,
-            pseudocount=pseudocount,
-        )
-        contrast = _welch_contrast(
-            donor_values=donor_values,
-            donor_col=donor_col,
-            species_col=species_col,
-            target_species=str(candidate["species"]),
-            expected_species=all_species,
-            confidence_level=confidence_level,
-        )
-        rows.append({**candidate, **contrast})
-    intervals = pd.DataFrame(rows)
+    contrasts = _candidate_contrasts(
+        adata=adata,
+        candidates=candidates,
+        taxonomy_cols=taxonomy_columns,
+        donor_col=donor_col,
+        species_col=species_col,
+        counts_layer=counts_layer,
+        library_size_col=library_size_col,
+        cell_mask=inference_mask,
+        expected_species=all_species,
+        confidence_level=confidence_level,
+        pseudocount=pseudocount,
+    )
+    intervals = pd.concat(
+        [candidates.reset_index(drop=True), contrasts], axis=1
+    )
     intervals["contrast_id"] = (
         intervals["gene"].astype(str)
         + "|"

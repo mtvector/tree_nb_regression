@@ -106,6 +106,22 @@ tax_coefficients = res.get_coefficients_df("tax_global")
 Raw nonnegative integer counts are required. Prefer `counts_layer` to replacing
 `adata.X`, which avoids copying a potentially large matrix.
 
+When fitting a restricted gene panel, preserve the full-transcriptome exposure
+in `obs` and pass it through `library_size_col`; otherwise the restricted panel
+would incorrectly define the NB offset and downstream CPM denominator:
+
+```python
+adata_panel.obs["full_library_size"] = np.asarray(full_counts.sum(axis=1)).ravel()
+res = fit_tree_nb(
+    adata_panel,
+    taxonomy_cols=["Class_V2", "Subclass_V2", "Group_V2"],
+    species_col="species",
+    species_tree="(Mouse,((Macaque_mulatta,Macaque_nemestrina),Human));",
+    donor_col="donor_name",
+    library_size_col="full_library_size",
+)
+```
+
 ## Level-specific empirical-Bayes shrinkage
 
 For comparisons between taxonomy levels, use invariant fitted contributions

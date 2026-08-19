@@ -1,15 +1,135 @@
 """Tests for donor-honest post-selection contrast inference."""
 from __future__ import annotations
 
+import anndata as ad
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 from tree_nb_regression.calibration import _make_calibration_adata
 from tree_nb_regression.honest_inference import (
     DonorSelectionConfig,
+    _candidate_contrasts,
+    _donor_log_cpm,
     _welch_contrast,
     donor_honest_intervals,
 )
+
+
+def test_vectorized_candidate_contrasts_match_scalar_reference() -> None:
+    """Batched donor-node aggregation preserves every scalar contrast result."""
+    adata = _make_calibration_adata(seed=17, n_donors_per_species=4)
+    candidates = pd.DataFrame(
+        [
+            {"level": "Class", "node_id": "A", "gene_index": 0, "species": species}
+            for species in ("Human", "Macaque", "Mouse")
+        ]
+        + [
+            {
+                "level": "cluster",
+                "node_id": "B/B2",
+                "gene_index": 1,
+                "species": "Macaque",
+            },
+            {
+                "level": "Class",
+                "node_id": "missing",
+                "gene_index": 2,
+                "species": "Human",
+            },
+        ]
+    )
+    species = ("Human", "Macaque", "Mouse")
+    cell_mask = np.ones(adata.n_obs, dtype=bool)
+    vectorized = _candidate_contrasts(
+        adata=adata,
+        candidates=candidates,
+        taxonomy_cols=("Class", "cluster"),
+        donor_col="donor",
+        species_col="species",
+        counts_layer=None,
+        library_size_col=None,
+        cell_mask=cell_mask,
+        expected_species=species,
+        confidence_level=0.95,
+        pseudocount=0.5,
+    )
+
+    obs = adata.obs.reset_index(drop=True)
+    ancestors = {
+        "Class": obs[["Class"]].astype(str).agg("/".join, axis=1),
+        "cluster": obs[["Class", "cluster"]].astype(str).agg("/".join, axis=1),
+    }
+    scalar_rows: list[dict[str, float | int | str]] = []
+    for candidate in candidates.itertuples(index=False):
+        node_mask = (ancestors[candidate.level] == candidate.node_id).to_numpy()
+        donor_values = _donor_log_cpm(
+            adata=adata,
+            cell_mask=node_mask & cell_mask,
+            donor_col="donor",
+            species_col="species",
+            gene_index=int(candidate.gene_index),
+            counts_layer=None,
+            library_size_col=None,
+            pseudocount=0.5,
+        )
+        scalar_rows.append(
+            _welch_contrast(
+                donor_values=donor_values,
+                donor_col="donor",
+                species_col="species",
+                target_species=str(candidate.species),
+                expected_species=species,
+                confidence_level=0.95,
+            )
+        )
+    scalar = pd.DataFrame(scalar_rows)
+
+    assert vectorized["status"].tolist() == scalar["status"].tolist()
+    numeric_columns = [
+        "estimate",
+        "se",
+        "df",
+        "ci_lo",
+        "ci_hi",
+        "statistic",
+        "p",
+        "n_target_donors",
+        "n_other_donors",
+    ]
+    ok = vectorized["status"] == "ok"
+    np.testing.assert_allclose(
+        vectorized.loc[ok, numeric_columns].to_numpy(dtype=float),
+        scalar.loc[ok, numeric_columns].to_numpy(dtype=float),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_donor_log_cpm_uses_external_full_library_size() -> None:
+    """Gene-panel inference can retain the full-transcriptome CPM denominator."""
+    adata = ad.AnnData(
+        X=sparse.csr_matrix([[5], [5]], dtype=np.int64),
+        obs=pd.DataFrame(
+            {
+                "donor": ["Human_1", "Human_1"],
+                "species": ["Human", "Human"],
+                "full_library_size": [100.0, 900.0],
+            }
+        ),
+    )
+    values = _donor_log_cpm(
+        adata=adata,
+        cell_mask=np.ones(2, dtype=bool),
+        donor_col="donor",
+        species_col="species",
+        gene_index=0,
+        counts_layer=None,
+        library_size_col="full_library_size",
+        pseudocount=0.5,
+    )
+    expected = np.log((10.0 + 0.5) / (1000.0 + 0.5) * 1_000_000.0)
+    assert np.isclose(values.loc[0, "log_cpm"], expected)
 
 
 def test_donor_honest_intervals_hold_out_complete_donors() -> None:

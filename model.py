@@ -1516,6 +1516,7 @@ def fit_tree_nb(
     batch_col: str | None = None,
     donor_col: str | None = None,
     counts_layer: str | None = None,
+    library_size_col: str | None = None,
     gene_chunk_size: int = 512,
     min_cells_per_pseudobulk: int = 10,
     global_lambda: float | None = None,
@@ -1554,6 +1555,10 @@ def fit_tree_nb(
         Obs column for donor/sample covariate.
     counts_layer : str, optional
         Layer name for counts. Default uses adata.X.
+    library_size_col : str, optional
+        Obs column containing each cell's full-transcriptome library size.
+        Use this when fitting a gene-subset AnnData so the NB offset is not
+        recomputed from the restricted panel.
     gene_chunk_size : int
         Number of genes to process per chunk.
     min_cells_per_pseudobulk : int
@@ -1698,7 +1703,11 @@ def fit_tree_nb(
     else:
         active_lambdas = penalty
 
-    # Compute library sizes from full data
+    if library_size_col is not None and library_size_col not in adata.obs:
+        raise KeyError(f"library-size column '{library_size_col}' was not found in obs.")
+
+    # Compute library sizes from the fitted matrix unless an external
+    # full-transcriptome exposure was supplied for a gene-subset fit.
     n_genes = adata.shape[1]
     gene_names = list(adata.var_names)
 
@@ -1710,7 +1719,11 @@ def fit_tree_nb(
 
     # Compute library sizes per pseudobulk group
     P = pb.cell_to_group
-    if sparse.issparse(X_full):
+    if library_size_col is not None:
+        cell_totals = np.asarray(adata.obs[library_size_col], dtype=np.float64)
+        if not np.isfinite(cell_totals).all() or (cell_totals < 0).any():
+            raise ValueError("library_size_col must contain finite nonnegative values.")
+    elif sparse.issparse(X_full):
         cell_totals = np.asarray(X_full.sum(axis=1)).ravel()
     else:
         cell_totals = X_full.sum(axis=1)
